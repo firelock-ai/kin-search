@@ -891,6 +891,77 @@ impl<Id: DocId> TextIndex<Id> {
         Ok(())
     }
 
+    /// Stage a batch of documents in one call, tokenizing them in parallel.
+    ///
+    /// Each `(id, fields)` entry is indexed exactly as a standalone
+    /// [`upsert`](Self::upsert) would index it — same tokenization, same
+    /// per-occurrence postings, same term frequencies. Only the CPU-bound
+    /// tokenization runs across the rayon thread pool; the inverted-index merge
+    /// then runs serially in batch order. `par_iter` over a slice is
+    /// index-ordered, so `collect` restores batch order exactly and the staged
+    /// index is identical to applying `upsert` to each entry in sequence,
+    /// independent of thread scheduling. A repeated `id` within the batch is
+    /// applied in order, so the last entry for that `id` wins, matching serial
+    /// upserts.
+    ///
+    /// Stages the change — call [`commit`](Self::commit) to make it visible to
+    /// searches.
+    pub fn upsert_batch(&self, batch: &[(Id, Vec<(&str, f32)>)]) -> Result<(), SearchError> {
+        let _span =
+            tracing::info_span!("kin_search.upsert_batch", batch_size = batch.len()).entered();
+
+        let tokenized: Vec<(Id, Vec<(String, f32)>)> = batch
+            .par_iter()
+            .map(|(id, fields)| {
+                let mut all_tokens: Vec<(String, f32)> = Vec::new();
+                for (text, weight) in fields {
+                    for tok in tokenize(text) {
+                        all_tokens.push((tok, *weight));
+                    }
+                }
+                (*id, all_tokens)
+            })
+            .collect();
+
+        // Canonical lock order matches `upsert`: `staged` first, then the
+        // live-state guards (only if `ensure_staged` clones a snapshot), strictly
+        // nested under `staged`, so no writer/committer pair can invert them.
+        let mut staged_guard = self.staged.write();
+        let state = self.ensure_staged(&mut staged_guard);
+
+        for (id, all_tokens) in tokenized {
+            let doc_length = all_tokens.len();
+
+            if let Some(old_doc) = state.docs.remove(&id) {
+                remove_doc_from_index(&mut state.index, &old_doc, &id);
+                state.doc_count = state.doc_count.saturating_sub(1);
+                state.total_doc_length = state.total_doc_length.saturating_sub(old_doc.doc_length);
+            }
+
+            for (token, weight) in &all_tokens {
+                state
+                    .index
+                    .entry(token.clone())
+                    .or_default()
+                    .add(id, *weight);
+            }
+            state.doc_count += 1;
+            state.total_doc_length += doc_length;
+
+            state.docs.insert(
+                id,
+                IndexedDoc {
+                    tokens_by_field: all_tokens,
+                    doc_length,
+                },
+            );
+            self.mark_doc_upserted(&id);
+        }
+
+        drop(staged_guard);
+        Ok(())
+    }
+
     /// Convenience: index a document that implements [`Searchable`].
     ///
     /// Extracts fields via [`Searchable::search_fields`] and delegates to
@@ -2961,55 +3032,51 @@ mod tests {
         );
     }
 
-    /// Gate: the parallel `rebuild_all_owned` must produce an index that is
-    /// byte-identical to the serial `rebuild_all` on the same corpus. Posting
-    /// lists live in `HashMap`s whose iteration order is seed-randomized per
-    /// instance, so both indexes are first lowered to a canonical (term-sorted,
-    /// doc-id-sorted) form; equality of that form — and of its serialized bytes —
+    // postings: term -> (occurrences, sorted [(doc_id, weight vec)])
+    type PostingRows = Vec<(String, usize, Vec<(u64, Vec<f32>)>)>;
+    // forward docs: id -> (doc_length, tokens_by_field)
+    type DocRows = Vec<(u64, usize, Vec<(String, f32)>)>;
+    // (postings, forward docs, doc_count, total_doc_length)
+    type Canon = (PostingRows, DocRows, usize, usize);
+
+    /// Lower a `TextIndex` to a canonical (term-sorted, doc-id-sorted) form.
+    /// Posting lists live in `HashMap`s whose iteration order is seed-randomized
+    /// per instance, so equality of this form — and of its serialized bytes —
     /// proves identical postings, per-term doc sets, per-doc weight vectors, term
-    /// frequencies, and BM25 aggregates regardless of thread scheduling.
+    /// frequencies, and BM25 aggregates regardless of `HashMap` iteration order.
+    fn canonical(idx: &TextIndex<TestId>) -> Canon {
+        let index = idx.index.read();
+        let docs = idx.docs.read();
+
+        let mut postings: PostingRows = index
+            .iter()
+            .map(|(term, p)| {
+                let mut by_doc: Vec<(u64, Vec<f32>)> =
+                    p.by_doc.iter().map(|(id, ws)| (id.0, ws.clone())).collect();
+                by_doc.sort_by_key(|(id, _)| *id);
+                (term.clone(), p.occurrences, by_doc)
+            })
+            .collect();
+        postings.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut doc_rows: DocRows = docs
+            .iter()
+            .map(|(id, d)| (id.0, d.doc_length, d.tokens_by_field.clone()))
+            .collect();
+        doc_rows.sort_by_key(|(id, _, _)| *id);
+
+        (
+            postings,
+            doc_rows,
+            *idx.doc_count.read(),
+            *idx.total_doc_length.read(),
+        )
+    }
+
+    /// Gate: the parallel `rebuild_all_owned` must produce an index that is
+    /// byte-identical to the serial `rebuild_all` on the same corpus.
     #[test]
     fn rebuild_all_owned_parallel_matches_serial_byte_for_byte() {
-        // postings: term -> (occurrences, sorted [(doc_id, weight vec)])
-        type PostingRows = Vec<(String, usize, Vec<(u64, Vec<f32>)>)>;
-        // forward docs: id -> (doc_length, tokens_by_field)
-        type DocRows = Vec<(u64, usize, Vec<(String, f32)>)>;
-        type Canon = (
-            PostingRows,
-            DocRows,
-            usize, // doc_count
-            usize, // total_doc_length
-        );
-
-        fn canonical(idx: &TextIndex<TestId>) -> Canon {
-            let index = idx.index.read();
-            let docs = idx.docs.read();
-
-            let mut postings: PostingRows = index
-                .iter()
-                .map(|(term, p)| {
-                    let mut by_doc: Vec<(u64, Vec<f32>)> =
-                        p.by_doc.iter().map(|(id, ws)| (id.0, ws.clone())).collect();
-                    by_doc.sort_by_key(|(id, _)| *id);
-                    (term.clone(), p.occurrences, by_doc)
-                })
-                .collect();
-            postings.sort_by(|a, b| a.0.cmp(&b.0));
-
-            let mut doc_rows: DocRows = docs
-                .iter()
-                .map(|(id, d)| (id.0, d.doc_length, d.tokens_by_field.clone()))
-                .collect();
-            doc_rows.sort_by_key(|(id, _, _)| *id);
-
-            (
-                postings,
-                doc_rows,
-                *idx.doc_count.read(),
-                *idx.total_doc_length.read(),
-            )
-        }
-
         // Code-like corpus with cross-document token overlap and tokens that
         // repeat within a single document, so postings carry multi-doc entries
         // and multi-occurrence weight vectors.
@@ -3077,6 +3144,90 @@ mod tests {
                 .iter()
                 .any(|(_, _, by_doc)| by_doc.iter().any(|(_, ws)| ws.len() > 1)),
             "corpus should produce at least one term with repeated occurrences in a doc"
+        );
+    }
+
+    /// Gate: the parallel `upsert_batch` must stage an index byte-identical to
+    /// applying `upsert` to each document serially in batch order — same
+    /// canonical-form and serialized-byte comparison as the rebuild gate.
+    #[test]
+    fn upsert_batch_matches_serial_upsert() {
+        // Corpus with cross-document token overlap and within-document repeats,
+        // plus a trailing re-upsert of an already-present id so the
+        // remove-then-reinsert path is exercised identically in both arms.
+        let n = 200usize;
+        let mut docs: Vec<(TestId, Vec<(String, f32)>)> = Vec::with_capacity(n + 1);
+        for i in 0..n {
+            let id = TestId(i as u64 + 1);
+            let name = format!("renderWidgetTree_{}", i % 13);
+            let signature = format!("fn render_widget_{}(depth: usize) -> Node_{}", i % 7, i % 5);
+            let file_path = format!("src/ui/widgets/tree_{}.rs", i % 19);
+            let kind = if i % 2 == 0 { "Function" } else { "Method" }.to_string();
+            docs.push((
+                id,
+                vec![(name, 5.0), (signature, 3.0), (file_path, 2.0), (kind, 1.0)],
+            ));
+        }
+        docs.push((
+            TestId(1),
+            vec![("renderWidgetTree_overwrite".to_string(), 4.0)],
+        ));
+
+        let borrowed: Vec<(TestId, Vec<(&str, f32)>)> = docs
+            .iter()
+            .map(|(id, fields)| {
+                (
+                    *id,
+                    fields
+                        .iter()
+                        .map(|(t, w)| (t.as_str(), *w))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+
+        let serial = TextIndex::<TestId>::new();
+        for (id, fields) in &borrowed {
+            serial.upsert(*id, fields).unwrap();
+        }
+        serial.commit().unwrap();
+
+        let batched = TextIndex::<TestId>::new();
+        batched.upsert_batch(&borrowed).unwrap();
+        batched.commit().unwrap();
+
+        let canon_serial = canonical(&serial);
+        let canon_batched = canonical(&batched);
+
+        assert_eq!(
+            canon_serial, canon_batched,
+            "upsert_batch produced a different index than serial upsert"
+        );
+
+        let bytes_serial = bincode::serialize(&canon_serial).unwrap();
+        let bytes_batched = bincode::serialize(&canon_batched).unwrap();
+        assert_eq!(
+            bytes_serial, bytes_batched,
+            "serialized index bytes differ between serial upsert and upsert_batch"
+        );
+
+        // Non-vacuous: the corpus must exercise multi-doc and multi-occurrence
+        // postings, and the re-upserted id must collapse to a single live doc.
+        assert!(
+            canon_serial.0.iter().any(|(_, _, by_doc)| by_doc.len() > 1),
+            "corpus should produce at least one term spanning multiple docs"
+        );
+        assert!(
+            canon_serial
+                .0
+                .iter()
+                .any(|(_, _, by_doc)| by_doc.iter().any(|(_, ws)| ws.len() > 1)),
+            "corpus should produce at least one term with repeated occurrences in a doc"
+        );
+        assert_eq!(
+            canon_serial.1.len(),
+            n,
+            "the trailing re-upsert of an existing id must not add a new live doc"
         );
     }
 }
