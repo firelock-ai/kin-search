@@ -2005,8 +2005,13 @@ where
                 archive_corrupt,
             ));
         }
-        let manifest: SegmentManifest = bincode::deserialize(&bytes)
-            .map_err(|err| corrupt_index_error(&m_path, format!("undecodable manifest: {err}"), archive_corrupt))?;
+        let manifest: SegmentManifest = bincode::deserialize(&bytes).map_err(|err| {
+            corrupt_index_error(
+                &m_path,
+                format!("undecodable manifest: {err}"),
+                archive_corrupt,
+            )
+        })?;
         if manifest.version != SEGMENTED_FORMAT_VERSION {
             return Err(corrupt_index_error(
                 &m_path,
@@ -2048,7 +2053,11 @@ where
                 )
             })?;
             let seg_data: SegmentData<Id> = bincode::deserialize(&seg_bytes).map_err(|err| {
-                corrupt_index_error(&m_path, format!("undecodable segment {s} gen {gen}: {err}"), archive_corrupt)
+                corrupt_index_error(
+                    &m_path,
+                    format!("undecodable segment {s} gen {gen}: {err}"),
+                    archive_corrupt,
+                )
             })?;
 
             // Merge this segment's postings. Doc sets are disjoint across
