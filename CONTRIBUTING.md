@@ -73,7 +73,8 @@ contributions from the community. A few requirements:
   produce and submit here.
 - **Review generated prose before publishing.** Commit messages and comments
   should accurately describe the technical change. Tool-specific attribution
-  is optional. Existing attribution must not be stripped.
+  is optional and is not required. Automation must not add, remove, or rewrite
+  it.
 
 ## Commit Messages
 
