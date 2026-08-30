@@ -2252,6 +2252,112 @@ mod tests {
         (id, doc)
     }
 
+    /// FIR-2968 measurement, not a guard. Prints every reverse-direction
+    /// substring match this crate's own test corpus produces, with the length
+    /// ratio for each, so the floor below is chosen from what the corpus
+    /// actually contains rather than from taste.
+    ///
+    /// The two directions are not symmetric. `token.contains(qt)` is ordinary
+    /// prefix and infix search: a query `pres` finding `present`. The reverse,
+    /// `qt.contains(token)`, is what returned a wrong answer: the query token
+    /// `definitely` found the vocabulary term `def`, which `fn present()` put in
+    /// the vocabulary, and `MIN_SUBSTRING_LEN` of 3 does not exclude it because
+    /// `def` is exactly 3 bytes.
+    ///
+    /// Run with `--nocapture` to read the table.
+    #[test]
+    fn measure_reverse_substring_ratios() {
+        use std::collections::BTreeSet;
+
+        // The corpus every other test in this module builds from `make_doc`.
+        let corpus = [
+            ("alpha", "src/alpha.rs", "Function"),
+            ("alphaHandler", "src/lib.rs", "Function"),
+            ("beta", "src/beta.rs", "Function"),
+            ("debugMe", "src/debug.rs", "Function"),
+            ("deletePost", "src/posts.rs", "Function"),
+            ("foo", "src/auth/login.rs", "Function"),
+            ("getUserById", "src/users.rs", "Function"),
+            ("myFunction", "src/lib.rs", "Function"),
+            ("persistMe", "src/persist.rs", "Function"),
+            ("QdpReader", "src/io/qdp.py", "Function"),
+            ("rebuiltDoc", "src/rebuilt.rs", "Function"),
+        ];
+
+        let mut vocab: BTreeSet<String> = BTreeSet::new();
+        for (name, file, kind) in corpus {
+            for field in [
+                name.to_string(),
+                format!("fn {name}()"),
+                file.to_string(),
+                kind.to_string(),
+            ] {
+                for token in tokenize(&field) {
+                    vocab.insert(token);
+                }
+            }
+        }
+        println!("VOCAB {} tokens: {:?}", vocab.len(), vocab);
+
+        // The decision cases, beside the corpus's own tokens as queries.
+        let mut queries: BTreeSet<String> = vocab.clone();
+        for extra in [
+            "definitelyNoSuchSymbol",
+            "definitely",
+            "usernames",
+            "pres",
+            "username",
+            "present",
+        ] {
+            for token in tokenize(extra) {
+                queries.insert(token);
+            }
+            queries.insert(extra.to_lowercase());
+        }
+
+        println!("--- reverse direction: the QUERY token contains the vocabulary term ---");
+        for q in &queries {
+            if q.len() < MIN_SUBSTRING_LEN {
+                continue;
+            }
+            for t in &vocab {
+                if t == q || t.len() < MIN_SUBSTRING_LEN {
+                    continue;
+                }
+                if q.contains(t.as_str()) && !t.contains(q.as_str()) {
+                    println!(
+                        "REVERSE q={:<24} t={:<12} ratio={:.3}",
+                        q,
+                        t,
+                        t.len() as f32 / q.len() as f32
+                    );
+                }
+            }
+        }
+
+        println!("--- the pairs the fix must separate, both directions ---");
+        for (q, t) in [
+            ("definitely", "def"),
+            ("usernames", "username"),
+            ("pres", "present"),
+            ("definitelynosuchsymbol", "def"),
+        ] {
+            let forward = t.contains(q);
+            let reverse = q.contains(t);
+            let (short, long) = if t.len() < q.len() { (t, q) } else { (q, t) };
+            println!(
+                "PAIR q={:<24} t={:<10} forward={:<5} reverse={:<5} ratio={:.3}",
+                q,
+                t,
+                forward,
+                reverse,
+                short.len() as f32 / long.len() as f32
+            );
+        }
+        println!("--- tokenize of the ticket's query ---");
+        println!("TOKENS {:?}", tokenize("definitelyNoSuchSymbol"));
+    }
+
     #[test]
     fn tokenize_camel_case() {
         let tokens = tokenize("parseTableFromHtml");
