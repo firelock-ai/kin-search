@@ -2472,7 +2472,7 @@ mod tests {
         assert!(
             hits.is_empty(),
             "a query whose tokens this index does not hold retrieved {} row(s); the corpus is \
-             'present', 'fn present()', 'src/a.py' and 'Function', and the query shares only the \
+             'present', 'def present()', 'src/a.py' and 'Function', and the query shares only the \
              vocabulary term 'def' sitting inside 'definitely': {hits:?}",
             hits.len()
         );
