@@ -2415,7 +2415,11 @@ mod tests {
             "usernames",
             "definitelyNoSuchSymbol",
         ] {
-            println!("REDUNDANCY {:<24} tokenize -> {:?}", original, tokenize(original));
+            println!(
+                "REDUNDANCY {:<24} tokenize -> {:?}",
+                original,
+                tokenize(original)
+            );
         }
     }
 
