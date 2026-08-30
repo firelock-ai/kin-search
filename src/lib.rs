@@ -2432,12 +2432,34 @@ mod tests {
     #[test]
     fn a_query_whose_terms_the_index_does_not_hold_retrieves_nothing() {
         let index = TextIndex::<TestId>::open(None).expect("open");
-        let (id, doc) = make_doc("present", "src/a.py", "Function");
+        // NOT `make_doc`, and that is the whole fixture. `make_doc` writes a
+        // signature of `fn {name}()`, which puts `fn` in the vocabulary and
+        // never `def`. kin's reproduction was a Python entity whose signature is
+        // `def present()`, and `def` is the token that sits inside `definitely`.
+        // Built through `make_doc` this test passed with the defect restored,
+        // because the term it is about was never indexed: the falsification
+        // caught it as a green cell under M1 where a red was required.
+        let id = next_id();
+        let doc = TestDoc {
+            name: "present".to_string(),
+            signature: "def present()".to_string(),
+            file_path: "src/a.py".to_string(),
+            kind: "Function".to_string(),
+        };
         index.upsert(id, &doc.search_fields()).expect("upsert");
         index.commit().expect("commit");
 
-        // The positive control first: without it, a search layer that answers
-        // nothing to everything would pass the assertion below.
+        // The term the defect travelled through has to actually be in the
+        // vocabulary, or the absence below is about a corpus that could never
+        // have matched.
+        assert!(
+            tokenize(&doc.signature).contains(&"def".to_string()),
+            "the fixture must index the token `def`, which is what sits inside `definitely`: {:?}",
+            tokenize(&doc.signature)
+        );
+
+        // The positive control: without it, a search layer that answers nothing
+        // to everything would pass the assertion below.
         let held = index.fuzzy_search("present", 10).expect("search");
         assert!(
             !held.is_empty(),
