@@ -2451,9 +2451,8 @@ where
                 // converted below rather than refused.
                 let decoded = if version >= SEGMENTED_FORMAT_VERSION {
                     DecodedSegment::Current(
-                        bincode::deserialize::<SegmentData<Id>>(&seg_bytes).map_err(|err| {
-                            format!("undecodable segment {s} gen {gen}: {err}")
-                        })?,
+                        bincode::deserialize::<SegmentData<Id>>(&seg_bytes)
+                            .map_err(|err| format!("undecodable segment {s} gen {gen}: {err}"))?,
                     )
                 } else {
                     DecodedSegment::Legacy(
@@ -3216,11 +3215,6 @@ mod tests {
         assert!(debug_str.contains("tokens"));
     }
 
-    /// Removing a document must cost work proportional ONLY to that document's
-    /// own occurrences — never to the (corpus-sized) length of a hot token's
-    /// posting list. This is the property that keeps bulk re-index linear; the
-    /// old flat-`Vec` `retain` made it O(corpus) per removal, i.e. O(n²) overall.
-    /// Operation-count based (not timing) so it is deterministic and not flaky.
     // ── FIR-3064: vocabulary ids in the forward index ───────────────────────
 
     /// An index written before the forward map held vocabulary ids still opens.
@@ -3316,7 +3310,10 @@ mod tests {
 
         // The negative controls, so the range is a range and not an acceptance
         // of anything.
-        for bogus in [MIN_SEGMENTED_FORMAT_VERSION - 1, SEGMENTED_FORMAT_VERSION + 1] {
+        for bogus in [
+            MIN_SEGMENTED_FORMAT_VERSION - 1,
+            SEGMENTED_FORMAT_VERSION + 1,
+        ] {
             let mut refused = manifest.clone();
             refused.version = bogus;
             std::fs::write(
@@ -3376,6 +3373,11 @@ mod tests {
         assert_eq!(index.fuzzy_search("header", 10).unwrap().len(), 2);
     }
 
+    /// Removing a document must cost work proportional ONLY to that document's
+    /// own occurrences — never to the (corpus-sized) length of a hot token's
+    /// posting list. This is the property that keeps bulk re-index linear; the
+    /// old flat-`Vec` `retain` made it O(corpus) per removal, i.e. O(n²) overall.
+    /// Operation-count based (not timing) so it is deterministic and not flaky.
     #[test]
     fn removal_touches_only_the_docs_own_postings() {
         fn removal_work(corpus: usize) -> usize {
