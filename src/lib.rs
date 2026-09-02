@@ -7,6 +7,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 use rayon::prelude::*;
@@ -80,10 +81,72 @@ pub trait Searchable {
 // ── Internal types ──────────────────────────────────────────────────────────
 
 /// A document stored in the forward index for deletion/update support.
+///
+/// Its tokens are vocabulary IDS, not owned strings. It used to hold a
+/// `Vec<(String, f32)>`, one heap-allocated `String` per token OCCURRENCE, and
+/// on a full VS Code tree that was 79,217,768 occurrences of 2,535,522 distinct
+/// tokens, 31.2 copies of each. Measured on the persisted index, those strings
+/// were 1,160,975,877 bytes of 2,679,660,206, and in memory about 48 bytes per
+/// occurrence against the 8 an inline `(u32, f32)` costs (FIR-3064).
+///
+/// The vocabulary the id indexes is the index's own, built from the tokens the
+/// inverted index already holds as keys, so the tokens exist once rather than
+/// once per occurrence.
 #[derive(Clone, Serialize, Deserialize)]
 struct IndexedDoc {
-    tokens_by_field: Vec<(String, f32)>, // (token, field_weight)
-    doc_length: usize,                   // total number of tokens in this doc
+    tokens_by_field: Vec<(u32, f32)>, // (vocabulary id, field_weight)
+    doc_length: usize,                // total number of tokens in this doc
+}
+
+/// The shape [`IndexedDoc`] had before its tokens became vocabulary ids.
+///
+/// Retained for reading only. A persisted index written by an older build
+/// carries this, and the loader converts it rather than refusing it, which is
+/// what keeps every store on disk openable. Never written.
+#[derive(Clone, Serialize, Deserialize)]
+struct LegacyIndexedDoc {
+    tokens_by_field: Vec<(String, f32)>,
+    doc_length: usize,
+}
+
+/// Token strings addressed by the `u32` ids [`IndexedDoc`] stores.
+///
+/// Grows monotonically: an id handed out stays valid for the life of the index,
+/// so a token whose postings are all removed keeps its slot rather than
+/// invalidating every document that ever mentioned it. A rebuild compacts it.
+///
+/// `tokens` and `ids` share one `Arc<str>` per token, so the vocabulary is one
+/// copy of each token beside the inverted index's own keys. That is about 100
+/// MB on a full VS Code tree, against the 3.17 GB the ids remove, and it is
+/// counted as this change's own overhead rather than ignored.
+#[derive(Clone, Default)]
+struct Vocabulary {
+    tokens: Vec<Arc<str>>,
+    ids: HashMap<Arc<str>, u32>,
+}
+
+impl Vocabulary {
+    /// The id for `token`, minting one if this is the first time it is seen.
+    fn intern(&mut self, token: &str) -> u32 {
+        if let Some(id) = self.ids.get(token) {
+            return *id;
+        }
+        let shared: Arc<str> = Arc::from(token);
+        let id = u32::try_from(self.tokens.len())
+            .expect("a vocabulary never reaches 4 billion distinct tokens");
+        self.tokens.push(Arc::clone(&shared));
+        self.ids.insert(shared, id);
+        id
+    }
+
+    /// The token an id names.
+    ///
+    /// `None` only for an id this vocabulary never handed out, which is a
+    /// defect rather than a state: ids come from `intern` and the table never
+    /// shrinks. Callers report it rather than skipping silently.
+    fn token(&self, id: u32) -> Option<&Arc<str>> {
+        self.tokens.get(id as usize)
+    }
 }
 
 /// Posting list for a single token.
@@ -672,21 +735,65 @@ pub fn tokenize(text: &str) -> Vec<String> {
 /// via the keyed [`Postings`] map — never a linear scan of the whole list.
 /// Returns the number of postings removed (the document's total occurrence
 /// count), which is independent of corpus size.
+/// A segment's vocabulary: its inverted index's keys, sorted.
+///
+/// The one derivation, used by the writer and the reader, so the ids a segment
+/// stores and the ids a load resolves cannot come from two different orderings.
+/// Sorted rather than hash-ordered because a `HashMap`'s iteration order is not
+/// stable across processes and would make a segment unreadable by anything but
+/// the process that wrote it.
+fn segment_vocabulary<Id: DocId>(index: &HashMap<String, Postings<Id>>) -> Vec<String> {
+    let mut tokens: Vec<String> = index.keys().cloned().collect();
+    tokens.sort_unstable();
+    tokens
+}
+
+/// Intern a document's tokens and return the ids, in the same order.
+///
+/// Order is the property that matters beyond the ids themselves: the persist
+/// path rebuilds each segment's postings by replaying a document's tokens in
+/// stored order, so a reordering here would change the bytes a reload produces.
+fn intern_all(vocab: &RwLock<Vocabulary>, tokens: &[(String, f32)]) -> Vec<(u32, f32)> {
+    let mut guard = vocab.write();
+    tokens
+        .iter()
+        .map(|(token, weight)| (guard.intern(token), *weight))
+        .collect()
+}
+
 fn remove_doc_from_index<Id: DocId>(
     index: &mut HashMap<String, Postings<Id>>,
+    vocab: &Vocabulary,
     doc: &IndexedDoc,
     doc_id: &Id,
 ) -> usize {
-    let mut unique_tokens = HashSet::new();
-    for (token, _) in &doc.tokens_by_field {
-        unique_tokens.insert(token);
+    // The ids are resolved through the vocabulary rather than compared as
+    // ids, because the inverted index is keyed by the token itself. A hash
+    // would have been smaller here and is not what this stores: two tokens
+    // sharing a hash would remove each other's postings, and a delete that
+    // drops the wrong postings is silent until a later search misses.
+    let mut unique_tokens: HashSet<&Arc<str>> = HashSet::new();
+    for (id, _) in &doc.tokens_by_field {
+        match vocab.token(*id) {
+            Some(token) => {
+                unique_tokens.insert(token);
+            }
+            None => {
+                tracing::error!(
+                    vocabulary_id = *id,
+                    vocabulary_len = vocab.tokens.len(),
+                    "a stored document names a token this index never interned; \
+                     its postings cannot be removed"
+                );
+            }
+        }
     }
     let mut removed = 0usize;
     for token in unique_tokens {
-        if let Some(postings) = index.get_mut(token) {
+        if let Some(postings) = index.get_mut(token.as_ref()) {
             removed += postings.remove(doc_id);
             if postings.is_empty() {
-                index.remove(token);
+                index.remove(token.as_ref());
             }
         }
     }
@@ -835,8 +942,16 @@ impl TrigramIndex {
 pub struct TextIndex<Id: DocId = u64> {
     /// Inverted index: lowercase token -> [`Postings`] keyed by document id.
     index: RwLock<HashMap<String, Postings<Id>>>,
-    /// Forward index: Id -> stored tokens (for delete-before-reinsert).
+    /// Forward index: Id -> stored token ids (for delete-before-reinsert).
     docs: RwLock<HashMap<Id, IndexedDoc>>,
+    /// Token strings the ids in `docs` name.
+    ///
+    /// Outside the staged/live split on purpose. A staged write mints ids and a
+    /// commit promotes the documents that hold them, so an id has to mean the
+    /// same token on both sides of a commit; a staged copy of this table would
+    /// let the two disagree. Ids are only ever added, never reused, so a reader
+    /// holding this lock never sees an id that has changed meaning.
+    vocab: RwLock<Vocabulary>,
     /// Total number of documents (for IDF calculation).
     doc_count: RwLock<usize>,
     /// Sum of all document lengths (for BM25 avgdl).
@@ -879,6 +994,7 @@ impl<Id: DocId> TextIndex<Id> {
         Self {
             index: RwLock::new(HashMap::new()),
             docs: RwLock::new(HashMap::new()),
+            vocab: RwLock::new(Vocabulary::default()),
             doc_count: RwLock::new(0),
             total_doc_length: RwLock::new(0),
             staged: RwLock::new(None),
@@ -962,6 +1078,7 @@ impl<Id: DocId> TextIndex<Id> {
         Self {
             index: RwLock::new(HashMap::new()),
             docs: RwLock::new(HashMap::new()),
+            vocab: RwLock::new(Vocabulary::default()),
             doc_count: RwLock::new(0),
             total_doc_length: RwLock::new(0),
             staged: RwLock::new(None),
@@ -1062,7 +1179,7 @@ impl<Id: DocId> TextIndex<Id> {
 
         // Remove old doc if present
         if let Some(old_doc) = state.docs.remove(&id) {
-            remove_doc_from_index(&mut state.index, &old_doc, &id);
+            remove_doc_from_index(&mut state.index, &self.vocab.read(), &old_doc, &id);
             state.doc_count = state.doc_count.saturating_sub(1);
             state.total_doc_length = state.total_doc_length.saturating_sub(old_doc.doc_length);
         }
@@ -1081,7 +1198,7 @@ impl<Id: DocId> TextIndex<Id> {
         state.docs.insert(
             id,
             IndexedDoc {
-                tokens_by_field: all_tokens,
+                tokens_by_field: intern_all(&self.vocab, &all_tokens),
                 doc_length,
             },
         );
@@ -1132,7 +1249,7 @@ impl<Id: DocId> TextIndex<Id> {
             let doc_length = all_tokens.len();
 
             if let Some(old_doc) = state.docs.remove(&id) {
-                remove_doc_from_index(&mut state.index, &old_doc, &id);
+                remove_doc_from_index(&mut state.index, &self.vocab.read(), &old_doc, &id);
                 state.doc_count = state.doc_count.saturating_sub(1);
                 state.total_doc_length = state.total_doc_length.saturating_sub(old_doc.doc_length);
             }
@@ -1150,7 +1267,7 @@ impl<Id: DocId> TextIndex<Id> {
             state.docs.insert(
                 id,
                 IndexedDoc {
-                    tokens_by_field: all_tokens,
+                    tokens_by_field: intern_all(&self.vocab, &all_tokens),
                     doc_length,
                 },
             );
@@ -1182,7 +1299,7 @@ impl<Id: DocId> TextIndex<Id> {
         let state = self.ensure_staged(&mut staged_guard);
 
         if let Some(old_doc) = state.docs.remove(id) {
-            remove_doc_from_index(&mut state.index, &old_doc, id);
+            remove_doc_from_index(&mut state.index, &self.vocab.read(), &old_doc, id);
             state.doc_count = state.doc_count.saturating_sub(1);
             state.total_doc_length = state.total_doc_length.saturating_sub(old_doc.doc_length);
         }
@@ -1207,7 +1324,7 @@ impl<Id: DocId> TextIndex<Id> {
 
         for id in ids {
             if let Some(old_doc) = state.docs.remove(id) {
-                remove_doc_from_index(&mut state.index, &old_doc, id);
+                remove_doc_from_index(&mut state.index, &self.vocab.read(), &old_doc, id);
                 state.doc_count = state.doc_count.saturating_sub(1);
                 state.total_doc_length = state.total_doc_length.saturating_sub(old_doc.doc_length);
             }
@@ -1253,7 +1370,7 @@ impl<Id: DocId> TextIndex<Id> {
             docs.insert(
                 *id,
                 IndexedDoc {
-                    tokens_by_field: all_tokens,
+                    tokens_by_field: intern_all(&self.vocab, &all_tokens),
                     doc_length,
                 },
             );
@@ -1328,7 +1445,7 @@ impl<Id: DocId> TextIndex<Id> {
             docs.insert(
                 id,
                 IndexedDoc {
-                    tokens_by_field: all_tokens,
+                    tokens_by_field: intern_all(&self.vocab, &all_tokens),
                     doc_length,
                 },
             );
@@ -1866,6 +1983,11 @@ where
         }
 
         let docs = self.docs.read();
+        // Held across the segment loop because every document's stored ids are
+        // resolved through it, and a write that interned a new token midway
+        // would leave one segment's ids resolving against a table another
+        // segment never saw.
+        let vocab = self.vocab.read();
         let doc_count = *self.doc_count.read();
         let total_doc_length = *self.total_doc_length.read();
         let graph_root_hash = *self.graph_root_hash.read();
@@ -1937,15 +2059,57 @@ where
                 // Reconstruct this doc's postings from its stored tokens in the
                 // exact same order `upsert`/`rebuild_all` built the global index,
                 // so the merged-on-load result is byte-for-byte the same index.
-                for (token, weight) in &doc.tokens_by_field {
+                for (token_id, weight) in &doc.tokens_by_field {
+                    let Some(token) = vocab.token(*token_id) else {
+                        return Err(SearchError::IndexError(format!(
+                            "text index segment {s} holds a document naming vocabulary id \
+                             {token_id}, which this index never interned"
+                        )));
+                    };
                     seg_index
-                        .entry(token.clone())
+                        .entry(token.as_ref().to_owned())
                         .or_default()
                         .add(*id, *weight);
                 }
                 seg_doc_count += 1;
                 seg_total_len += doc.doc_length;
                 seg_docs.insert(*id, doc.clone());
+            }
+            // A segment's vocabulary is its own inverted index's keys, sorted.
+            // Derived rather than stored: the tokens are already in the file as
+            // those keys, and writing them twice would put back a share of what
+            // this change removes. Sorted so the derivation is the same on both
+            // sides and independent of hash order.
+            let seg_vocab = segment_vocabulary(&seg_index);
+            let seg_ids: HashMap<&str, u32> = seg_vocab
+                .iter()
+                .enumerate()
+                .map(|(position, token)| {
+                    (
+                        token.as_str(),
+                        u32::try_from(position).expect("a segment holds under 4 billion tokens"),
+                    )
+                })
+                .collect();
+            // Rewrite the global ids the live index uses into this segment's
+            // own, because a global id means nothing to a process that has not
+            // built this exact vocabulary.
+            for doc in seg_docs.values_mut() {
+                for (token_id, _) in doc.tokens_by_field.iter_mut() {
+                    let Some(token) = vocab.token(*token_id) else {
+                        return Err(SearchError::IndexError(format!(
+                            "text index segment {s} holds a document naming vocabulary id \
+                             {token_id}, which this index never interned"
+                        )));
+                    };
+                    let Some(local) = seg_ids.get(token.as_ref()) else {
+                        return Err(SearchError::IndexError(format!(
+                            "text index segment {s} holds token {token:?} in a document but not \
+                             in its own inverted index"
+                        )));
+                    };
+                    *token_id = *local;
+                }
             }
             let seg_data = SegmentData {
                 index: seg_index,
@@ -2984,7 +3148,7 @@ mod tests {
             docs.insert(
                 id,
                 IndexedDoc {
-                    tokens_by_field: all_tokens,
+                    tokens_by_field: intern_all(&self.vocab, &all_tokens),
                     doc_length,
                 },
             );
