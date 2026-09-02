@@ -240,11 +240,18 @@ struct StagedState<Id: DocId> {
     total_doc_length: usize,
 }
 
+/// The monolithic on-disk layout, whose documents keep owned token strings.
+///
+/// Unchanged by the move to vocabulary ids, deliberately. The segmented writer
+/// is the default and the measured 2.68 GB index on a full VS Code tree is
+/// segmented, so there is no measured saving here to pay a third version ladder
+/// for. Its loader already accepts v1 and v2 rather than only the newest, so it
+/// never carried the hole the segmented manifest did.
 #[derive(Clone, Serialize, Deserialize)]
 struct PersistedIndex<Id: DocId> {
     version: u32,
     index: HashMap<String, Postings<Id>>,
-    docs: HashMap<Id, IndexedDoc>,
+    docs: HashMap<Id, LegacyIndexedDoc>,
     doc_count: usize,
     total_doc_length: usize,
     graph_root_hash: Option<[u8; 32]>,
@@ -254,7 +261,7 @@ struct PersistedIndex<Id: DocId> {
 struct PersistedIndexRef<'a, Id: DocId> {
     version: u32,
     index: &'a HashMap<String, Postings<Id>>,
-    docs: &'a HashMap<Id, IndexedDoc>,
+    docs: &'a HashMap<Id, LegacyIndexedDoc>,
     doc_count: usize,
     total_doc_length: usize,
     graph_root_hash: Option<[u8; 32]>,
@@ -267,7 +274,7 @@ struct PersistedIndexRef<'a, Id: DocId> {
 struct PersistedIndexV1<Id: DocId> {
     version: u32,
     index: HashMap<String, Vec<(Id, f32)>>,
-    docs: HashMap<Id, IndexedDoc>,
+    docs: HashMap<Id, LegacyIndexedDoc>,
     doc_count: usize,
     total_doc_length: usize,
     graph_root_hash: Option<[u8; 32]>,
@@ -305,7 +312,18 @@ impl<Id: DocId> PersistedIndex<Id> {
 /// one immutable `seg-<k>-<gen>` file per non-empty segment). Distinct from the
 /// monolithic [`TEXT_INDEX_FORMAT_VERSION`] because it is a different file set;
 /// the manifest is the single versioned, atomically-swapped commit point.
-pub const SEGMENTED_FORMAT_VERSION: u32 = 3;
+pub const SEGMENTED_FORMAT_VERSION: u32 = 4;
+
+/// The oldest segmented format this build READS.
+///
+/// Reading is a range and writing is a point, and conflating them is a
+/// migration nobody asked for. v3 differs from v4 only in that a document's
+/// tokens are owned strings rather than ids into the segment's vocabulary,
+/// which the loader converts. Both checks below were equalities before v4
+/// existed, which would have made every index on disk unreadable the moment the
+/// version moved, exactly as an equality on a persisted schema did in kin-db
+/// PR 271 (FIR-3064).
+pub const MIN_SEGMENTED_FORMAT_VERSION: u32 = 3;
 
 /// Default number of segments a doc set is partitioned into when the segmented
 /// persistence path is active. Each segment is an independent, immutable file;
@@ -407,6 +425,7 @@ struct SegmentData<Id: DocId> {
 struct LoadedSegmented<Id: DocId> {
     index: HashMap<String, Postings<Id>>,
     docs: HashMap<Id, IndexedDoc>,
+    vocab: Vocabulary,
     doc_count: usize,
     total_doc_length: usize,
     graph_root_hash: Option<[u8; 32]>,
@@ -735,6 +754,80 @@ pub fn tokenize(text: &str) -> Vec<String> {
 /// via the keyed [`Postings`] map — never a linear scan of the whole list.
 /// Returns the number of postings removed (the document's total occurrence
 /// count), which is independent of corpus size.
+/// The shape [`SegmentData`] had at v3, when a document's tokens were owned
+/// strings rather than ids into the segment's vocabulary. Read only.
+#[derive(Serialize, Deserialize)]
+struct LegacySegmentData<Id: DocId> {
+    index: HashMap<String, Postings<Id>>,
+    docs: HashMap<Id, LegacyIndexedDoc>,
+    doc_count: usize,
+    total_doc_length: usize,
+}
+
+/// One decoded segment, at whichever version the manifest declared.
+///
+/// Both arms carry the same inverted index; they differ only in how a document
+/// names its tokens, which is the whole of the v3-to-v4 change.
+enum DecodedSegment<Id: DocId> {
+    Current(SegmentData<Id>),
+    Legacy(LegacySegmentData<Id>),
+}
+
+/// Turn documents that carry owned token strings into documents that carry
+/// vocabulary ids, interning as it goes.
+fn intern_legacy_docs<Id: DocId>(
+    docs: HashMap<Id, LegacyIndexedDoc>,
+    vocab: &mut Vocabulary,
+) -> HashMap<Id, IndexedDoc> {
+    docs.into_iter()
+        .map(|(id, doc)| {
+            (
+                id,
+                IndexedDoc {
+                    tokens_by_field: doc
+                        .tokens_by_field
+                        .iter()
+                        .map(|(token, weight)| (vocab.intern(token), *weight))
+                        .collect(),
+                    doc_length: doc.doc_length,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The reverse, for the monolithic format, which keeps owned strings.
+///
+/// Returns an error rather than skipping an unresolvable id: a document written
+/// with a token this index cannot name would come back missing that token, and
+/// a search would then quietly stop matching it.
+fn externalize_docs<Id: DocId>(
+    docs: &HashMap<Id, IndexedDoc>,
+    vocab: &Vocabulary,
+) -> Result<HashMap<Id, LegacyIndexedDoc>, SearchError> {
+    let mut out = HashMap::with_capacity(docs.len());
+    for (id, doc) in docs {
+        let mut tokens = Vec::with_capacity(doc.tokens_by_field.len());
+        for (token_id, weight) in &doc.tokens_by_field {
+            let Some(token) = vocab.token(*token_id) else {
+                return Err(SearchError::IndexError(format!(
+                    "a stored document names vocabulary id {token_id}, which this index never \
+                     interned; refusing to persist it without that token"
+                )));
+            };
+            tokens.push((token.as_ref().to_owned(), *weight));
+        }
+        out.insert(
+            *id,
+            LegacyIndexedDoc {
+                tokens_by_field: tokens,
+                doc_length: doc.doc_length,
+            },
+        );
+    }
+    Ok(out)
+}
+
 /// A segment's vocabulary: its inverted index's keys, sorted.
 ///
 /// The one derivation, used by the writer and the reader, so the ids a segment
@@ -1754,6 +1847,7 @@ where
             *index.index.write() = loaded.index;
             index.index_epoch.fetch_add(1, Ordering::Relaxed);
             *index.docs.write() = loaded.docs;
+            *index.vocab.write() = loaded.vocab;
             *index.doc_count.write() = loaded.doc_count;
             *index.total_doc_length.write() = loaded.total_doc_length;
             *index.graph_root_hash.write() = loaded.graph_root_hash;
@@ -1765,7 +1859,9 @@ where
         } else if let Some(persisted) = Self::load_persisted(&storage_path, persist_changes)? {
             *index.index.write() = persisted.index;
             index.index_epoch.fetch_add(1, Ordering::Relaxed);
-            *index.docs.write() = persisted.docs;
+            let mut vocab = Vocabulary::default();
+            *index.docs.write() = intern_legacy_docs(persisted.docs, &mut vocab);
+            *index.vocab.write() = vocab;
             *index.doc_count.write() = persisted.doc_count;
             *index.total_doc_length.write() = persisted.total_doc_length;
             *index.graph_root_hash.write() = persisted.graph_root_hash;
@@ -1926,13 +2022,17 @@ where
 
         let index = self.index.read();
         let docs = self.docs.read();
+        // The monolithic format carries owned strings, so the ids are resolved
+        // back through the vocabulary on the way out. That costs one copy of
+        // the tokens during this write and nothing at rest.
+        let external_docs = externalize_docs(&docs, &self.vocab.read())?;
         let doc_count = *self.doc_count.read();
         let total_doc_length = *self.total_doc_length.read();
         let graph_root_hash = *self.graph_root_hash.read();
         let persisted = PersistedIndexRef {
             version: PersistedIndex::<Id>::VERSION,
             index: &index,
-            docs: &docs,
+            docs: &external_docs,
             doc_count,
             total_doc_length,
             graph_root_hash,
@@ -2245,10 +2345,14 @@ where
             ));
         }
         let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        if version != SEGMENTED_FORMAT_VERSION {
+        if !(MIN_SEGMENTED_FORMAT_VERSION..=SEGMENTED_FORMAT_VERSION).contains(&version) {
             return Err(corrupt_index_error(
                 &m_path,
-                format!("unsupported segmented manifest version {version}"),
+                format!(
+                    "unsupported segmented manifest version {version}; this build reads {} \
+                     through {}",
+                    MIN_SEGMENTED_FORMAT_VERSION, SEGMENTED_FORMAT_VERSION
+                ),
                 archive_corrupt,
             ));
         }
@@ -2259,7 +2363,7 @@ where
                 archive_corrupt,
             )
         })?;
-        if manifest.version != SEGMENTED_FORMAT_VERSION {
+        if manifest.version != version {
             return Err(corrupt_index_error(
                 &m_path,
                 format!(
@@ -2283,6 +2387,9 @@ where
 
         let mut index: HashMap<String, Postings<Id>> = HashMap::new();
         let mut docs: HashMap<Id, IndexedDoc> = HashMap::new();
+        // Built as the segments merge, so every document's ids come out naming
+        // the same table regardless of which segment it arrived in.
+        let mut vocab = Vocabulary::default();
         let mut segment_docs: Vec<HashSet<Id>> = vec![HashSet::new(); manifest.segment_count];
         let mut doc_count = 0usize;
         let mut total_doc_length = 0usize;
@@ -2298,7 +2405,7 @@ where
         // would archive for segments the sequential loader never reached. The
         // ordered scan below turns the first bad segment in index order into
         // exactly one archived error, which is what the sequential loader did.
-        let decoded: Vec<Result<Option<SegmentData<Id>>, String>> = manifest
+        let decoded: Vec<Result<Option<DecodedSegment<Id>>, String>> = manifest
             .segment_gens
             .par_iter()
             .enumerate()
@@ -2311,9 +2418,23 @@ where
                 let seg_file = segment_path(storage_path, s, *gen);
                 let seg_bytes = std::fs::read(&seg_file)
                     .map_err(|err| format!("missing/unreadable segment {s} gen {gen}: {err}"))?;
-                let seg_data: SegmentData<Id> = bincode::deserialize(&seg_bytes)
-                    .map_err(|err| format!("undecodable segment {s} gen {gen}: {err}"))?;
-                Ok(Some(seg_data))
+                // Which shape to expect is the manifest's declared version,
+                // not this build's. A v3 index on disk stays readable and is
+                // converted below rather than refused.
+                let decoded = if version >= SEGMENTED_FORMAT_VERSION {
+                    DecodedSegment::Current(
+                        bincode::deserialize::<SegmentData<Id>>(&seg_bytes).map_err(|err| {
+                            format!("undecodable segment {s} gen {gen}: {err}")
+                        })?,
+                    )
+                } else {
+                    DecodedSegment::Legacy(
+                        bincode::deserialize::<LegacySegmentData<Id>>(&seg_bytes).map_err(
+                            |err| format!("undecodable v{version} segment {s} gen {gen}: {err}"),
+                        )?,
+                    )
+                };
+                Ok(Some(decoded))
             })
             .collect();
 
@@ -2329,11 +2450,71 @@ where
                 }
             };
 
+            // Resolve this segment's documents into the merged vocabulary
+            // BEFORE its inverted index is folded in, because a v4 document's
+            // ids name positions in THIS segment's own key set and that set
+            // stops existing the moment the merge starts.
+            let (seg_index, seg_docs, seg_doc_count, seg_total_doc_length) = match seg_data {
+                DecodedSegment::Current(seg_data) => {
+                    let seg_vocab = segment_vocabulary(&seg_data.index);
+                    let mut resolved: HashMap<Id, IndexedDoc> =
+                        HashMap::with_capacity(seg_data.docs.len());
+                    for (id, mut doc) in seg_data.docs {
+                        for (token_id, _) in doc.tokens_by_field.iter_mut() {
+                            let Some(token) = seg_vocab.get(*token_id as usize) else {
+                                return Err(corrupt_index_error(
+                                    &m_path,
+                                    format!(
+                                        "segment {s} holds a document naming token {token_id} of \
+                                         a {}-token vocabulary",
+                                        seg_vocab.len()
+                                    ),
+                                    archive_corrupt,
+                                ));
+                            };
+                            *token_id = vocab.intern(token);
+                        }
+                        resolved.insert(id, doc);
+                    }
+                    (
+                        seg_data.index,
+                        resolved,
+                        seg_data.doc_count,
+                        seg_data.total_doc_length,
+                    )
+                }
+                DecodedSegment::Legacy(seg_data) => {
+                    // A v3 document carries its tokens as strings, so it is
+                    // interned directly and needs no per-segment vocabulary.
+                    let mut resolved: HashMap<Id, IndexedDoc> =
+                        HashMap::with_capacity(seg_data.docs.len());
+                    for (id, doc) in seg_data.docs {
+                        resolved.insert(
+                            id,
+                            IndexedDoc {
+                                tokens_by_field: doc
+                                    .tokens_by_field
+                                    .iter()
+                                    .map(|(token, weight)| (vocab.intern(token), *weight))
+                                    .collect(),
+                                doc_length: doc.doc_length,
+                            },
+                        );
+                    }
+                    (
+                        seg_data.index,
+                        resolved,
+                        seg_data.doc_count,
+                        seg_data.total_doc_length,
+                    )
+                }
+            };
+
             // Merge this segment's postings. Doc sets are disjoint across
             // segments, so this is a pure union; a collision means the on-disk
             // segmentation drifted (e.g. a hash-impl change) — surface it as
             // corruption rather than silently double-counting.
-            for (token, postings) in seg_data.index {
+            for (token, postings) in seg_index {
                 let entry = index.entry(token).or_default();
                 for (id, weights) in postings.by_doc {
                     let occ = weights.len();
@@ -2347,7 +2528,7 @@ where
                     entry.occurrences += occ;
                 }
             }
-            for (id, doc) in seg_data.docs {
+            for (id, doc) in seg_docs {
                 segment_docs[s].insert(id);
                 if docs.insert(id, doc).is_some() {
                     return Err(corrupt_index_error(
@@ -2357,8 +2538,8 @@ where
                     ));
                 }
             }
-            doc_count += seg_data.doc_count;
-            total_doc_length += seg_data.total_doc_length;
+            doc_count += seg_doc_count;
+            total_doc_length += seg_total_doc_length;
         }
 
         if doc_count != manifest.doc_count || total_doc_length != manifest.total_doc_length {
@@ -2375,6 +2556,7 @@ where
         Ok(LoadedSegmented {
             index,
             docs,
+            vocab,
             doc_count,
             total_doc_length,
             graph_root_hash: manifest.graph_root_hash,
@@ -3016,6 +3198,7 @@ mod tests {
         fn removal_work(corpus: usize) -> usize {
             let mut index: HashMap<String, Postings<TestId>> = HashMap::new();
             let mut docs: HashMap<TestId, IndexedDoc> = HashMap::new();
+            let mut vocab = Vocabulary::default();
             for i in 0..corpus {
                 let id = TestId(i as u64);
                 // Every doc shares the high-frequency token "shared" (its posting
@@ -3027,14 +3210,17 @@ mod tests {
                 docs.insert(
                     id,
                     IndexedDoc {
-                        tokens_by_field: tokens,
+                        tokens_by_field: tokens
+                            .iter()
+                            .map(|(tok, w)| (vocab.intern(tok), *w))
+                            .collect(),
                         doc_length: 2,
                     },
                 );
             }
             let target = TestId(0);
             let doc = docs.get(&target).cloned().unwrap();
-            remove_doc_from_index(&mut index, &doc, &target)
+            remove_doc_from_index(&mut index, &vocab, &doc, &target)
         }
 
         let small = removal_work(100);
@@ -3125,7 +3311,7 @@ mod tests {
         struct V1Mirror {
             version: u32,
             index: HashMap<String, Vec<(TestId, f32)>>,
-            docs: HashMap<TestId, IndexedDoc>,
+            docs: HashMap<TestId, LegacyIndexedDoc>,
             doc_count: usize,
             total_doc_length: usize,
             graph_root_hash: Option<[u8; 32]>,
@@ -3147,8 +3333,8 @@ mod tests {
             let mut docs = HashMap::new();
             docs.insert(
                 id,
-                IndexedDoc {
-                    tokens_by_field: intern_all(&self.vocab, &all_tokens),
+                LegacyIndexedDoc {
+                    tokens_by_field: all_tokens,
                     doc_length,
                 },
             );
@@ -4238,7 +4424,7 @@ mod tests {
     // postings: term -> (occurrences, sorted [(doc_id, weight vec)])
     type PostingRows = Vec<(String, usize, Vec<(u64, Vec<f32>)>)>;
     // forward docs: id -> (doc_length, tokens_by_field)
-    type DocRows = Vec<(u64, usize, Vec<(String, f32)>)>;
+    type DocRows = Vec<(u64, usize, Vec<(u32, f32)>)>;
     // (postings, forward docs, doc_count, total_doc_length)
     type Canon = (PostingRows, DocRows, usize, usize);
 
