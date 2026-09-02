@@ -1,6 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+//! # How a document names its tokens
+//!
+//! The forward index stores VOCABULARY IDS, not owned token strings. It used to
+//! store a `String` per token OCCURRENCE, which on a full VS Code tree was
+//! 79,217,768 occurrences of 2,535,522 distinct tokens, 31.2 copies of each,
+//! and 1,160,975,877 bytes of a 2,679,660,206-byte persisted index (FIR-3064).
+//!
+//! Two vocabularies exist and they are not the same table.
+//!
+//! - The LIVE one is global to the index, grows monotonically, and is what the
+//!   ids in `docs` name. An id handed out never changes meaning, so a token
+//!   whose postings all go keeps its slot rather than invalidating every
+//!   document that mentioned it.
+//! - A PERSISTED segment's is its own inverted index's keys, sorted. It is
+//!   derived rather than stored, because those tokens are already in the file
+//!   as the index's keys, and sorted rather than hash-ordered because a
+//!   `HashMap`'s iteration order is not stable across processes.
+//!
+//! **The load order is the correctness argument.** A segment's document ids
+//! name positions in THAT segment's key set, and the merge folds every
+//! segment's keys into one map, so the ids must be resolved against the
+//! segment's own sorted keys BEFORE its inverted index is merged. Resolve them
+//! after and every document silently names a different token.
+//!
+//! A delete resolves ids through the vocabulary rather than comparing hashes.
+//! Two tokens sharing a hash would remove each other's postings, and a delete
+//! that drops the wrong postings is silent until a later search misses.
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -439,7 +467,7 @@ struct LoadedSegmented<Id: DocId> {
 /// place *after* all referenced segment files are fsynced — so a crash either
 /// leaves the previous manifest (old segments) or the new one (all new/kept
 /// segments present), never a torn half-applied set.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct SegmentManifest {
     version: u32,
     segment_count: usize,
@@ -3193,6 +3221,161 @@ mod tests {
     /// posting list. This is the property that keeps bulk re-index linear; the
     /// old flat-`Vec` `retain` made it O(corpus) per removal, i.e. O(n²) overall.
     /// Operation-count based (not timing) so it is deterministic and not flaky.
+    // ── FIR-3064: vocabulary ids in the forward index ───────────────────────
+
+    /// An index written before the forward map held vocabulary ids still opens.
+    ///
+    /// This is the migration the change must not require, and the manifest's
+    /// two version checks were equalities, so before this test the answer was
+    /// that it did require one. The fixture is aged deliberately rather than
+    /// mocked: a real index is built and persisted by this build, then every
+    /// segment is rewritten in the v3 shape with its documents carrying owned
+    /// token strings, and the manifest is re-stamped v3. Nothing else changes.
+    ///
+    /// Then it is opened and SEARCHED, because a load that produced an index
+    /// with the right document count and the wrong token ids would pass a
+    /// shape assertion and fail a query.
+    #[test]
+    fn an_index_written_before_vocabulary_ids_still_opens_and_searches() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("index.bin");
+
+        // Build and persist at the current version.
+        let (id_a, doc_a) = make_doc("parse_header", "src/parse.rs", "function");
+        let (id_b, doc_b) = make_doc("render_header", "src/render.rs", "function");
+        let expected = {
+            let index: TextIndex<TestId> = TextIndex::open(Some(&storage)).unwrap();
+            index.upsert_searchable(id_a, &doc_a).unwrap();
+            index.upsert_searchable(id_b, &doc_b).unwrap();
+            index.commit().unwrap();
+            index.fuzzy_search("header", 10).unwrap()
+        };
+        assert_eq!(expected.len(), 2, "the fixture must match both documents");
+        assert!(
+            manifest_path(&storage).exists(),
+            "the fixture must have persisted segmented, or this ages nothing"
+        );
+
+        // Age it: every segment becomes v3, its documents carrying owned strings.
+        let m_bytes = std::fs::read(manifest_path(&storage)).unwrap();
+        let mut manifest: SegmentManifest = bincode::deserialize(&m_bytes).unwrap();
+        assert_eq!(
+            manifest.version, SEGMENTED_FORMAT_VERSION,
+            "the fixture must start at the version this build writes"
+        );
+        let mut aged_any = false;
+        for (s, gen_opt) in manifest.segment_gens.iter().enumerate() {
+            let Some(gen) = gen_opt else { continue };
+            let seg_file = segment_path(&storage, s, *gen);
+            let current: SegmentData<TestId> =
+                bincode::deserialize(&std::fs::read(&seg_file).unwrap()).unwrap();
+            let seg_vocab = segment_vocabulary(&current.index);
+            let legacy = LegacySegmentData {
+                docs: current
+                    .docs
+                    .iter()
+                    .map(|(id, doc)| {
+                        (
+                            *id,
+                            LegacyIndexedDoc {
+                                tokens_by_field: doc
+                                    .tokens_by_field
+                                    .iter()
+                                    .map(|(token_id, weight)| {
+                                        (seg_vocab[*token_id as usize].clone(), *weight)
+                                    })
+                                    .collect(),
+                                doc_length: doc.doc_length,
+                            },
+                        )
+                    })
+                    .collect(),
+                index: current.index,
+                doc_count: current.doc_count,
+                total_doc_length: current.total_doc_length,
+            };
+            std::fs::write(&seg_file, bincode::serialize(&legacy).unwrap()).unwrap();
+            aged_any = true;
+        }
+        assert!(aged_any, "the fixture must have at least one live segment");
+        manifest.version = MIN_SEGMENTED_FORMAT_VERSION;
+        std::fs::write(
+            manifest_path(&storage),
+            bincode::serialize(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // It opens, and it answers the same query the same way.
+        let reopened: TextIndex<TestId> = TextIndex::open(Some(&storage)).unwrap();
+        let got = reopened.fuzzy_search("header", 10).unwrap();
+        assert_eq!(
+            got, expected,
+            "a v{MIN_SEGMENTED_FORMAT_VERSION} index must answer exactly as the \
+             v{SEGMENTED_FORMAT_VERSION} one it was aged from"
+        );
+
+        // The negative controls, so the range is a range and not an acceptance
+        // of anything.
+        for bogus in [MIN_SEGMENTED_FORMAT_VERSION - 1, SEGMENTED_FORMAT_VERSION + 1] {
+            let mut refused = manifest.clone();
+            refused.version = bogus;
+            std::fs::write(
+                manifest_path(&storage),
+                bincode::serialize(&refused).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                TextIndex::<TestId>::open(Some(&storage)).is_err(),
+                "a manifest declaring v{bogus} must be refused"
+            );
+        }
+    }
+
+    /// Deleting a document removes its postings, and reinserting it restores
+    /// exactly them.
+    ///
+    /// The forward map exists for this and nothing else, which is why it could
+    /// afford to stop holding token strings. The test is written so it fails if
+    /// a delete leaves stale postings: the deleted document's unique token must
+    /// stop matching, and the document it shared a token with must keep
+    /// matching. Breaking the id lookup in `remove_doc_from_index` fails the
+    /// first assertion, because the postings are then never found to remove.
+    #[test]
+    fn a_delete_removes_exactly_its_own_postings_and_a_reinsert_restores_them() {
+        let index: TextIndex<TestId> = TextIndex::new();
+        let (shared_id, shared_doc) = make_doc("shared_header", "src/shared.rs", "function");
+        let (gone_id, gone_doc) = make_doc("doomed_header", "src/doomed.rs", "function");
+        index.upsert_searchable(shared_id, &shared_doc).unwrap();
+        index.upsert_searchable(gone_id, &gone_doc).unwrap();
+        index.commit().unwrap();
+
+        // The positive control: before the delete, both the shared token and
+        // the doomed document's unique token match.
+        assert_eq!(index.fuzzy_search("header", 10).unwrap().len(), 2);
+        assert_eq!(index.fuzzy_search("doomed", 10).unwrap().len(), 1);
+
+        index.remove(&gone_id).unwrap();
+        index.commit().unwrap();
+
+        assert!(
+            index.fuzzy_search("doomed", 10).unwrap().is_empty(),
+            "the deleted document's own token still matches, so its postings were left behind"
+        );
+        let survivors = index.fuzzy_search("header", 10).unwrap();
+        assert_eq!(
+            survivors.len(),
+            1,
+            "the shared token must still match the document that was not deleted"
+        );
+        assert_eq!(survivors[0].0, shared_id);
+
+        // Reinsert, and the index is back where it started.
+        index.upsert_searchable(gone_id, &gone_doc).unwrap();
+        index.commit().unwrap();
+        assert_eq!(index.fuzzy_search("doomed", 10).unwrap().len(), 1);
+        assert_eq!(index.fuzzy_search("header", 10).unwrap().len(), 2);
+    }
+
     #[test]
     fn removal_touches_only_the_docs_own_postings() {
         fn removal_work(corpus: usize) -> usize {
