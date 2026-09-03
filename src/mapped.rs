@@ -1040,6 +1040,13 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
     /// No forward map is consulted, because none exists: the ordinal's bit is
     /// set and every posting walk skips it from here on. The document's postings
     /// leave the file only when its segment is next rewritten.
+    ///
+    /// **The bit is not persisted by this call.** Tombstones live in the
+    /// manifest, and the manifest is written by [`write_mapped`], so a removal
+    /// made through this reader is visible to this handle and is lost when it is
+    /// dropped. That is the reader's contract until the commit path moves onto
+    /// this layout, and it is stated rather than implied because a delete that
+    /// silently does not survive a reopen is the worst shape this could take.
     pub fn remove(&mut self, id: &Id) -> bool {
         let Some((segment, ordinal)) = self.segment_and_ordinal(id) else {
             return false;
@@ -1115,10 +1122,24 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
             if slots.is_empty() {
                 continue;
             }
-            let Ok(df) = self.live_df(&slots) else {
-                continue;
+            let df = match self.live_df(&slots) {
+                Ok(df) => df as usize,
+                Err(error) => {
+                    // This returns a `usize` to match the heap index's
+                    // signature, so a corrupt term cannot be reported to the
+                    // caller. It is reported here instead of being treated as an
+                    // absent token, because "absent" is a legitimate answer and
+                    // corruption silently wearing its costume is how a search
+                    // that quietly stops matching gets shipped.
+                    tracing::error!(
+                        token = %token,
+                        error = %error,
+                        "a mapped term could not be counted; treating it as absent for \
+                         doc_frequency"
+                    );
+                    continue;
+                }
             };
-            let df = df as usize;
             minimum = Some(minimum.map_or(df, |m: usize| m.min(df)));
         }
         minimum.unwrap_or(0)
@@ -1144,7 +1165,10 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
         matched
     }
 
-    /// Indexed tokens that sit INSIDE `query_token` and carry enough of it.
+    /// Tokens that could sit INSIDE `query_token` and carry enough of it.
+    ///
+    /// Candidates, not matches: presence in the term dictionary is the caller's
+    /// filter, and it is applied there anyway.
     ///
     /// Enumerated rather than searched. Only a substring of the query can match
     /// this direction, and [`reverse_substring_admits`] floors its length at
@@ -1152,7 +1176,7 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
     /// `query_token.len()` and each is one exact lookup in the term dictionary.
     /// A trigram index is not needed to find them and a traversal is not needed
     /// to filter them.
-    fn reverse_substring_matches(&self, query_token: &str) -> BTreeSet<Vec<u8>> {
+    fn reverse_substring_candidates(&self, query_token: &str) -> BTreeSet<Vec<u8>> {
         let mut matched: BTreeSet<Vec<u8>> = BTreeSet::new();
         let bytes = query_token.as_bytes();
         for start in 0..bytes.len() {
@@ -1169,9 +1193,12 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
                 if !reverse_substring_admits(query_token, candidate_str) {
                     continue;
                 }
-                if self.slots_for(candidate_str).is_empty() {
-                    continue;
-                }
+                // Deliberately NOT probed for presence here. The caller's own
+                // empty-slots check drops a candidate no segment holds, and
+                // dropping elements from a sorted sequence leaves the order of
+                // the rest alone, so the matched set and its visit order are
+                // identical either way. Probing here would double the term
+                // dictionary lookups a fuzzy query pays.
                 matched.insert(candidate.to_vec());
             }
         }
@@ -1202,7 +1229,7 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
 
             if query_token.len() >= MIN_SUBSTRING_LEN {
                 let mut matched = self.forward_substring_matches(query_token);
-                matched.extend(self.reverse_substring_matches(query_token));
+                matched.extend(self.reverse_substring_candidates(query_token));
                 for token in matched {
                     let Ok(token) = std::str::from_utf8(&token) else {
                         continue;
@@ -1237,6 +1264,12 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
         query_str: &str,
         limit: usize,
     ) -> Result<Vec<(Id, f32)>, SearchError> {
+        let _span = tracing::info_span!(
+            "kin_search.mapped.fuzzy_search",
+            query = %query_str,
+            limit = limit
+        )
+        .entered();
         let query_tokens = tokenize(query_str);
         if query_tokens.is_empty() || self.doc_count == 0 {
             return Ok(Vec::new());
@@ -2053,8 +2086,20 @@ mod tests {
                 .map(|token| token.as_bytes().to_vec())
                 .collect();
 
-            let mut got = mapped.forward_substring_matches(&query_token);
-            got.extend(mapped.reverse_substring_matches(&query_token));
+            // The set under test is the one the SCORER visits: the union of
+            // both directions, filtered by presence in the term dictionary,
+            // exactly as `scoring_terms` filters it. The reverse direction
+            // returns candidates rather than matches, because probing them here
+            // would only double the lookups the caller already performs.
+            let mut union = mapped.forward_substring_matches(&query_token);
+            union.extend(mapped.reverse_substring_candidates(&query_token));
+            let got: BTreeSet<Vec<u8>> = union
+                .into_iter()
+                .filter(|token| match std::str::from_utf8(token) {
+                    Ok(token) => !mapped.slots_for(token).is_empty(),
+                    Err(_) => false,
+                })
+                .collect();
             assert_eq!(
                 got, want,
                 "substring matches for {query_token:?} differ from a full term scan"
