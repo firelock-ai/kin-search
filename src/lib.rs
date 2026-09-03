@@ -1614,8 +1614,12 @@ impl<Id: DocId> TextIndex<Id> {
         *self.docs.write() = docs;
         *self.doc_count.write() = doc_count;
         *self.total_doc_length.write() = total_doc_length;
-        // Clear any pending staged state.
-        *self.staged.write() = None;
+        // Published under ONE guard rather than five. `commit` holds this same
+        // lock across its whole persist, including the point where it releases
+        // the vocabulary, so a rebuild that published field by field could have
+        // its documents naming ids a freshly reset table no longer holds.
+        let mut staged_guard = self.staged.write();
+        *staged_guard = None;
         // And the mapping this replaces. A rebuild puts the whole corpus in the
         // heap maps, so leaving a mapped backend installed would leave BOTH
         // holding committed state, reads still answering from the stale image,
@@ -1624,6 +1628,7 @@ impl<Id: DocId> TextIndex<Id> {
         // to rebuild the text index from the graph.
         *self.mapped.write() = None;
         self.mark_all_segments_dirty();
+        drop(staged_guard);
 
         Ok(())
     }
@@ -1692,7 +1697,8 @@ impl<Id: DocId> TextIndex<Id> {
         *self.docs.write() = docs;
         *self.doc_count.write() = doc_count;
         *self.total_doc_length.write() = total_doc_length;
-        *self.staged.write() = None;
+        let mut staged_guard = self.staged.write();
+        *staged_guard = None;
         // And the mapping this replaces. A rebuild puts the whole corpus in the
         // heap maps, so leaving a mapped backend installed would leave BOTH
         // holding committed state, reads still answering from the stale image,
@@ -1701,6 +1707,7 @@ impl<Id: DocId> TextIndex<Id> {
         // to rebuild the text index from the graph.
         *self.mapped.write() = None;
         self.mark_all_segments_dirty();
+        drop(staged_guard);
 
         Ok(())
     }
@@ -1774,9 +1781,16 @@ impl<Id: DocId> TextIndex<Id> {
         Id: Serialize + DeserializeOwned,
     {
         let Some(path) = self.path.as_ref() else {
-            // Read-only handle: a mapped index it cannot write to. Dropping the
-            // delta is what `persist_to_disk` already does for this case.
-            return Ok(());
+            // A read-only handle over a mapped store. It cannot write, and it
+            // cannot absorb the delta either, because the committed state IS the
+            // mapping and a delta only becomes visible by rewriting it. The heap
+            // path could publish into its live maps and so appeared to work
+            // in-process; here that would be a silent discard, so it refuses.
+            return Err(SearchError::IndexError(
+                "this index was opened read-only and serves from a mapping, so a commit has \
+                 nowhere to go; reopen for writing to commit"
+                    .to_string(),
+            ));
         };
         let (upserts, removed) = match state {
             Some(state) => (state.docs, state.removed),
@@ -1835,7 +1849,12 @@ impl<Id: DocId> TextIndex<Id> {
             })?;
 
         drop(mapped_guard);
-        let reopened = MappedIndex::open(path)?;
+        // The disk is already the new image, so the mapping in hand is stale
+        // whatever happens next. Dropping it before the reopen means a failure
+        // cannot leave a handle that folds the OLD image into the next commit
+        // and silently reverts what this one just wrote.
+        *self.mapped.write() = None;
+        let reopened = MappedIndex::open_archiving(path, true)?;
         if reopened.live_document_count() != doc_count
             || reopened.total_doc_length() != total_doc_length
         {
@@ -2111,10 +2130,14 @@ where
             None
         });
 
-        // Auto-detect the on-disk format independently of the write-side flag, so
-        // toggling `KIN_SEARCH_INCREMENTAL_PERSIST` is safe in both directions: a
-        // segmented index opened with the flag off still loads (and the next
-        // monolithic commit retires it), and vice-versa.
+        // Auto-detect the on-disk format independently of the write-side flag.
+        //
+        // The flag is no longer a two-way lever, and saying so is the honest
+        // form. A v5 image is MAPPED whatever the flag says, and a commit on a
+        // mapped store rewrites the mapping before `persist_to_disk` ever
+        // consults the flag, so a v5 store with the flag off keeps writing v5.
+        // The route back to monolithic is a `rebuild_all`, which releases the
+        // mapping, and then a commit. A v3 or v4 index still loads either way.
         if manifest_path(&storage_path).exists() {
             // A mapped image is MAPPED, not decoded. This is the whole cutover
             // in three lines: the segment files are opened, their headers and
@@ -2133,6 +2156,13 @@ where
                 let mapped = MappedIndex::open_archiving(&storage_path, persist_changes)?;
                 let segment_count = mapped.segment_count().max(1);
                 *index.graph_root_hash.write() = mapped.graph_root_hash();
+                // The counters travel with it. They are a shadow of the
+                // mapping's on a mapped store, and leaving them at zero made a
+                // consistency check downstream compare zero against zero and
+                // pass, which is how an empty image could be written over a
+                // full one and report success.
+                *index.doc_count.write() = mapped.live_document_count();
+                *index.total_doc_length.write() = mapped.total_doc_length();
                 *index.mapped.write() = Some(mapped);
                 index.index_epoch.fetch_add(1, Ordering::Relaxed);
                 let mut seg = index.seg.write();
@@ -2649,6 +2679,20 @@ where
     /// path with an extension is the storage file, one without is a directory
     /// holding `index.bin`.
     pub fn persist_mapped(&self, path: &Path) -> Result<(), SearchError> {
+        // It writes the HEAP index, and on a mapped store the heap is empty by
+        // design. Without this it would publish a manifest of zero documents,
+        // reclaim every segment file the old one named, and report success,
+        // because the counters it cross-checks against are the same zero.
+        //
+        // A commit is how a mapped store is written now, so this refuses rather
+        // than guessing which the caller meant.
+        if self.mapped.read().is_some() {
+            return Err(SearchError::IndexError(
+                "this index already serves from a mapping; commit writes it, and persisting the \
+                 heap side here would publish an empty image over it"
+                    .to_string(),
+            ));
+        }
         let storage_path = storage_file_path_for(path);
         self.write_mapped_image(&storage_path)?;
         // The mapped image is now the canonical one at this path, so the bincode

@@ -776,6 +776,16 @@ where
     })?;
     crate::write_and_promote(&manifest_path(storage_path), &encoded)?;
 
+    // The superseded MONOLITHIC file too, and this is not tidiness.
+    //
+    // `open` prefers the manifest and falls back to `index.bin` only when there
+    // is none. So a store converted from the monolithic format that later has
+    // its manifest archived as corrupt would, on the open after that, find the
+    // pre-conversion `index.bin` still sitting there and serve a corpus from
+    // before the conversion, with no error and the graph-root stamp intact. The
+    // bincode writer removed this file for exactly that reason.
+    let _ = std::fs::remove_file(storage_path);
+
     // Committed. Reclaim the generations the new manifest no longer names.
     // Best-effort on purpose: an orphan is harmless because load only follows
     // the manifest, and on Windows a file another process still has mapped
@@ -802,28 +812,36 @@ pub(crate) fn write_mapped<Id: DocId + Serialize>(
     segment_count: usize,
     graph_root_hash: Option<[u8; 32]>,
 ) -> Result<(usize, usize), SearchError> {
-    write_mapped_streaming(storage_path, segment_count, graph_root_hash, |segment| {
-        let mut build = SegmentBuild::new();
-        for (id, doc_length) in doc_lengths {
-            if crate::segment_of(id, segment_count) == segment {
-                build.push_document_meta(*id, *doc_length)?;
-            }
+    // Bucketed in ONE pass, not once per segment.
+    //
+    // The first version of this asked the streaming writer for segment k and
+    // scanned the whole inverted index to answer, which is a 64x multiplier on
+    // the hashing and the map probes, and it sits on the rebuild path kin-db
+    // takes after every admission. The memory argument for streaming does not
+    // apply here either: this converts a heap index the caller is already
+    // holding, so the corpus is resident whatever this does. What streaming
+    // buys, and what is kept, is that only one segment is ENCODED at a time.
+    let mut buckets: Vec<SegmentBuild<Id>> =
+        (0..segment_count).map(|_| SegmentBuild::new()).collect();
+    for (id, doc_length) in doc_lengths {
+        buckets[crate::segment_of(id, segment_count)].push_document_meta(*id, *doc_length)?;
+    }
+    let mut segment_of_id: HashMap<Id, usize> = HashMap::with_capacity(doc_lengths.len());
+    for id in doc_lengths.keys() {
+        segment_of_id.insert(*id, crate::segment_of(id, segment_count));
+    }
+    for (token, postings) in index {
+        for (id, weights) in &postings.by_doc {
+            let Some(segment) = segment_of_id.get(id) else {
+                continue;
+            };
+            buckets[*segment].push_postings(*id, token, weights);
         }
-        if build.is_empty() {
-            return Ok(build);
-        }
-        for (token, postings) in index {
-            for (id, weights) in &postings.by_doc {
-                if !doc_lengths.contains_key(id) {
-                    continue;
-                }
-                if crate::segment_of(id, segment_count) != segment {
-                    continue;
-                }
-                build.push_postings(*id, token, weights);
-            }
-        }
-        Ok(build)
+    }
+
+    let mut buckets = buckets.into_iter();
+    write_mapped_streaming(storage_path, segment_count, graph_root_hash, |_| {
+        Ok(buckets.next().unwrap_or_else(SegmentBuild::new))
     })
 }
 
