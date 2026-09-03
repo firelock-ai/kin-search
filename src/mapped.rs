@@ -2737,6 +2737,22 @@ mod tests {
             format!("{error}").contains("no read can reach"),
             "the refusal must name it, got: {error}"
         );
+
+        // And through the ORDINARY load path, which is the arm that makes the
+        // shared reconciliation load-bearing there.
+        //
+        // The tombstone-count case above is caught on that path anyway, by
+        // rehydrate's own walk disagreeing with the manifest, so removing the
+        // reconciliation left every assertion green: the falsification run
+        // reported `rehydrate-unreconciled` as a SURVIVOR. Reachability is the
+        // one thing the reconciliation uniquely adds there, because the walk
+        // only ever visits ordinals below the document count and so cannot see
+        // a bit above it. Last on this image, because the refusal archives the
+        // manifest.
+        assert!(
+            TextIndex::<Key>::open(Some(&far_storage)).is_err(),
+            "the ordinary load path must refuse an unreachable tombstone too"
+        );
     }
 
     /// The reverse direction's length floor must be the predicate's own floor.
