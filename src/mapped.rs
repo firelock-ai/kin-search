@@ -3315,22 +3315,20 @@ mod tests {
         expected.push((resurrected, after_doc("resurrectedName")));
         let reference = heap_index(&expected);
 
-        for handle in [&opened] {
-            assert_eq!(
-                handle.live_document_count(),
-                reference.live_document_count(),
-                "document count after the delta"
-            );
-            assert!(
-                !handle.contains(&removed),
-                "the removed document is still visible"
-            );
-            assert!(handle.contains(&added), "the added document is missing");
-            assert!(
-                handle.contains(&resurrected),
-                "the resurrected document is missing"
-            );
-        }
+        assert_eq!(
+            opened.live_document_count(),
+            reference.live_document_count(),
+            "document count after the delta"
+        );
+        assert!(
+            !opened.contains(&removed),
+            "the removed document is still visible"
+        );
+        assert!(opened.contains(&added), "the added document is missing");
+        assert!(
+            opened.contains(&resurrected),
+            "the resurrected document is missing"
+        );
 
         // And after a reopen, because a commit that only changed memory would
         // pass everything above.
