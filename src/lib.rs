@@ -4068,9 +4068,13 @@ mod tests {
     }
 
     fn read_manifest_gens(storage: &Path) -> Vec<Option<u64>> {
-        let bytes = std::fs::read(manifest_path(storage)).unwrap();
-        let manifest: SegmentManifest = bincode::deserialize(&bytes).unwrap();
-        manifest.segment_gens
+        // Delegates to the production reader rather than decoding bincode
+        // directly. A fixture built through `build_into` writes v5 since the
+        // cutover, so the manifest here is a `MappedManifest`, not the v3/v4
+        // `SegmentManifest` this helper used to assume; `mapped::
+        // read_manifest_gens` is the one place both shapes are already
+        // dispatched on the version prefix.
+        mapped::read_manifest_gens(storage)
     }
 
     fn first_present_segment(storage: &Path) -> usize {
