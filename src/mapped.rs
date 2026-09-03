@@ -2691,15 +2691,30 @@ mod tests {
         // the one `TextIndex::open` actually calls. The hardening lived only in
         // the mapped reader for a round, so this exact image opened there with
         // one document fewer, no error, and the graph-root stamp still trusted.
+        //
+        // This is LAST on this image on purpose: the ordinary path archives a
+        // corrupt manifest as its designed recovery, so the file is gone
+        // afterwards and any further arm here would fail on a missing manifest
+        // rather than on what it meant to test. The first run of this test
+        // failed exactly that way.
         assert!(
             TextIndex::<Key>::open(Some(&storage)).is_err(),
             "the ordinary load path must refuse what the mapped reader refuses"
         );
+        assert!(
+            !m_path.exists(),
+            "the ordinary path's recovery is to archive the manifest, so it must be gone"
+        );
 
-        // And a bit past the segment's document count: unreachable by every
-        // read, so it removes nothing, but it makes `any()` true and drops every
-        // `df` in that segment off the O(1) stored count onto a counted walk.
-        let bytes = std::fs::read(&m_path).expect("read manifest");
+        // A bit PAST the segment's document count, on its own image. It is
+        // unreachable by every read, so it removes nothing, and yet it makes
+        // `any()` true and drops every `df` in that segment off the O(1) stored
+        // count onto a full counted walk.
+        let far = tempfile::tempdir().expect("tempdir");
+        heap.persist_mapped(far.path()).expect("persist_mapped");
+        let far_storage = crate::storage_file_path_for(far.path());
+        let far_manifest = manifest_path(&far_storage);
+        let bytes = std::fs::read(&far_manifest).expect("read manifest");
         let mut manifest: MappedManifest = bincode::deserialize(&bytes).expect("decode manifest");
         let segment = manifest
             .segment_gens
@@ -2707,9 +2722,16 @@ mod tests {
             .position(Option::is_some)
             .expect("some segment has a file");
         manifest.tombstones[segment] = Tombstones::for_docs(4096);
-        manifest.tombstones[segment].set(4095);
-        std::fs::write(&m_path, bincode::serialize(&manifest).expect("encode")).expect("write");
-        let error = MappedIndex::<Key>::open(dir.path())
+        assert!(
+            manifest.tombstones[segment].set(4095),
+            "the control: the bit must actually be set"
+        );
+        std::fs::write(
+            &far_manifest,
+            bincode::serialize(&manifest).expect("encode"),
+        )
+        .expect("write");
+        let error = MappedIndex::<Key>::open(far.path())
             .expect_err("an unreachable tombstone must be refused");
         assert!(
             format!("{error}").contains("no read can reach"),
