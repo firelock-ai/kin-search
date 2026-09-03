@@ -2868,5 +2868,83 @@ mod tests {
             format!("{error}").contains("truncated header"),
             "the refusal must name the reason, got: {error}"
         );
+
+        // Section offsets, so the arms below poke the right bytes rather than
+        // guessing at them.
+        let terms_off = read_u64(&intact, 40).expect("terms offset") as usize;
+        let terms_len = read_u64(&intact, 48).expect("terms length") as usize;
+        let post_off = read_u64(&intact, 56).expect("postings offset") as usize;
+        let docs_off = read_u64(&intact, 72).expect("docs offset") as usize;
+        assert!(
+            terms_len > 64,
+            "the term dictionary must be big enough to corrupt in the middle"
+        );
+
+        // A byte flipped in the MIDDLE of the term dictionary, with the tail
+        // left intact so fst's own cheap length-and-root check still passes.
+        // Only the checksum catches this, and without it a traversal panics on
+        // an out-of-bounds node, fails to terminate on a cycle, or quietly
+        // yields a wrong term set and wrong postings offsets.
+        let mut bad_fst = intact.clone();
+        bad_fst[terms_off + terms_len / 2] ^= 0xff;
+        std::fs::write(&seg_file, &bad_fst).expect("write");
+        let error = MappedIndex::<Key>::open(dir.path())
+            .expect_err("a corrupt term dictionary must be refused");
+        assert!(
+            format!("{error}").contains("checksum"),
+            "the refusal must name the checksum, got: {error}"
+        );
+
+        // One document-id offset shifted back. `bincode` ignores trailing
+        // bytes, so an over-long slice decodes fine and one document's score
+        // comes back under ANOTHER live document's id, with the same id twice in
+        // one result list. Nothing but validating the table catches it.
+        let mut bad_docs = intact.clone();
+        let at = docs_off + 8 + 4 * 3;
+        let shifted = read_u32(&intact, at).expect("id offset").saturating_sub(4);
+        bad_docs[at..at + 4].copy_from_slice(&shifted.to_le_bytes());
+        std::fs::write(&seg_file, &bad_docs).expect("write");
+        let error = MappedIndex::<Key>::open(dir.path())
+            .expect_err("a shifted document-id offset must be refused");
+        let message = format!("{error}");
+        assert!(
+            message.contains("gap or an overlap")
+                || message.contains("inconsistent id length")
+                || message.contains("does not sort after"),
+            "the refusal must name the table, got: {message}"
+        );
+
+        // A weight count of 2^63 at the head of the postings section. The
+        // postings are not validated at open, deliberately, so this is refused
+        // at QUERY time: without the bound the reservation runs before the
+        // per-entry read that would have caught it, and the query dies of a
+        // capacity overflow instead of returning an error.
+        let mut bad_weights = intact.clone();
+        bad_weights[post_off..post_off + 10]
+            .copy_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01]);
+        std::fs::write(&seg_file, &bad_weights).expect("write");
+        let mapped: MappedIndex<Key> =
+            MappedIndex::open(dir.path()).expect("the header and tables are still intact");
+        let error = mapped
+            .fuzzy_search("shared", 10)
+            .expect_err("an impossible weight count must be refused");
+        assert!(
+            format!("{error}").contains("weight table"),
+            "the refusal must name the weight table, got: {error}"
+        );
+        drop(mapped);
+
+        // And the control again, so none of the above passed because the
+        // fixture was broken from the start.
+        std::fs::write(&seg_file, &intact).expect("write");
+        let mapped: MappedIndex<Key> =
+            MappedIndex::open(dir.path()).expect("the intact bytes must open");
+        assert_reaches_every_document(
+            "restored",
+            &mapped
+                .fuzzy_search("shared", docs.len() * 2)
+                .expect("restored search"),
+            docs.len(),
+        );
     }
 }
