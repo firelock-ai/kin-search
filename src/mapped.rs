@@ -208,10 +208,6 @@ impl Tombstones {
     fn any(&self) -> bool {
         self.set_count > 0
     }
-
-    fn count(&self) -> usize {
-        self.set_count
-    }
 }
 
 // ── A mapped byte range ──────────────────────────────────────────────────────
