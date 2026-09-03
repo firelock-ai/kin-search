@@ -671,6 +671,43 @@ fn encode_segment<Id: DocId + Serialize>(
     Ok(Some(out))
 }
 
+/// The generations the manifest on disk names, whichever shape it is, or an
+/// empty list when there is no readable manifest there.
+///
+/// Shared by BOTH writers, and that is the point rather than a convenience. A
+/// writer that derives generations only from its own in-memory baseline will
+/// pick 0 whenever that baseline is absent, and 0 is exactly what the other
+/// writer picks on an empty directory. The two then rename onto the same names
+/// while a manifest still points at them, which is the window either writer's
+/// generation scheme exists to close.
+pub(crate) fn read_manifest_gens(storage_path: &Path) -> Vec<Option<u64>> {
+    let Ok(bytes) = std::fs::read(manifest_path(storage_path)) else {
+        return Vec::new();
+    };
+    if bytes.len() < 4 {
+        return Vec::new();
+    }
+    let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if version == MAPPED_SEGMENT_VERSION {
+        return match bincode::deserialize::<MappedManifest>(&bytes) {
+            Ok(manifest) if manifest.version == MAPPED_SEGMENT_VERSION => manifest.segment_gens,
+            _ => Vec::new(),
+        };
+    }
+    // A v3 or v4 manifest's generations count too, because `segment_path` is one
+    // namespace shared by both formats. Ignoring them let a mapped write rename
+    // over the very files a live bincode manifest named, which destroys the
+    // previous image before the new manifest is published: a crash in that
+    // window leaves the old manifest pointing at a mixture.
+    if (crate::MIN_SEGMENTED_FORMAT_VERSION..MAPPED_SEGMENT_VERSION).contains(&version) {
+        return match bincode::deserialize::<crate::SegmentManifest>(&bytes) {
+            Ok(manifest) if manifest.version == version => manifest.segment_gens,
+            _ => Vec::new(),
+        };
+    }
+    Vec::new()
+}
+
 /// Write a mapped image one segment at a time.
 ///
 /// `build` is asked for segment `k` and hands back everything that segment
