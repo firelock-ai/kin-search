@@ -1755,7 +1755,10 @@ impl<Id: DocId> TextIndex<Id> {
     /// skipped, which costs write bandwidth and buys the guarantee that the new
     /// manifest names only files this commit wrote. Skipping is the next change
     /// and it needs the dirty set to be trustworthy first.
-    fn commit_mapped(&self, state: Option<StagedState<Id>>) -> Result<(), SearchError> {
+    fn commit_mapped(&self, state: Option<StagedState<Id>>) -> Result<(), SearchError>
+    where
+        Id: Serialize + DeserializeOwned,
+    {
         let Some(path) = self.path.as_ref() else {
             // Read-only handle: a mapped index it cannot write to. Dropping the
             // delta is what `persist_to_disk` already does for this case.
