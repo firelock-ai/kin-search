@@ -139,6 +139,14 @@ fn get_uvarint(data: &[u8], pos: &mut usize) -> Option<u64> {
         *pos += 1;
         result |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
+            // A canonical encoding never ENDS in a zero byte unless it is the
+            // single byte `00`. Rejecting only the lossy over-long form left
+            // `81 00` and `80 80 ... 00` decoding happily, so two byte strings
+            // still mapped to one value and the doc comment was broader than
+            // the code.
+            if shift > 0 && byte == 0 {
+                return None;
+            }
             return Some(result);
         }
         shift += 7;
@@ -239,6 +247,20 @@ impl Tombstones {
 
     fn any(&self) -> bool {
         self.set_count > 0
+    }
+
+    /// The highest ordinal with its bit set, if any.
+    ///
+    /// Used to refuse a bit no read can reach, which is a removal that does not
+    /// remove anything and yet costs every `df` in that segment a counted walk.
+    fn highest_set(&self) -> Option<usize> {
+        for (index, word) in self.words.iter().enumerate().rev() {
+            if *word != 0 {
+                let top = 63 - word.leading_zeros() as usize;
+                return Some(index * 64 + top);
+            }
+        }
+        None
     }
 }
 
@@ -675,15 +697,22 @@ pub(crate) fn write_mapped<Id: DocId + Serialize>(
     Ok(())
 }
 
-/// The generations the manifest on disk names, or an empty list when there is
-/// no mapped manifest there.
+/// The generations the manifest on disk names, whichever shape it is, or an
+/// empty list when there is no readable manifest there.
+///
+/// Shared by BOTH writers, and that is the point rather than a convenience. A
+/// writer that derives generations only from its own in-memory baseline will
+/// pick 0 whenever that baseline is absent, and 0 is exactly what the other
+/// writer picks on an empty directory. The two then rename onto the same names
+/// while a manifest still points at them, which is the window either writer's
+/// generation scheme exists to close.
 ///
 /// Read as raw little-endian bytes for the version first, because a v3 or v4
 /// manifest is a different struct and `bincode` allows trailing bytes: decoding
 /// one as a `MappedManifest` would yield plausible generations rather than fail.
 /// A non-mapped or unreadable manifest yields no generations, so the write below
 /// starts at 0 and cannot collide with a file this format never wrote.
-fn read_manifest_gens(storage_path: &Path) -> Vec<Option<u64>> {
+pub(crate) fn read_manifest_gens(storage_path: &Path) -> Vec<Option<u64>> {
     let Ok(bytes) = std::fs::read(manifest_path(storage_path)) else {
         return Vec::new();
     };
@@ -740,6 +769,11 @@ struct TermCursor<'a> {
     pos: usize,
     remaining: u64,
     previous: i64,
+    /// Occurrences the term declared and the walk has not yet spent. Two bounds
+    /// rather than one: this caps the term as a whole, `doc_length` caps each
+    /// document, and neither alone is enough because a file can inflate either
+    /// side on its own.
+    budget: u64,
 }
 
 impl TermCursor<'_> {
@@ -795,6 +829,11 @@ impl TermCursor<'_> {
                      document of {doc_length} tokens"
                 ));
             }
+            let spend = u64::try_from(repeat).map_err(|_| "run length out of range")?;
+            self.budget = self
+                .budget
+                .checked_sub(spend)
+                .ok_or("a term's runs claim more occurrences than the term declares")?;
             for _ in 0..repeat {
                 weights.push(weight);
             }
@@ -929,37 +968,76 @@ impl MappedSegment {
                 self.doc_count
             ));
         }
-        let mut previous_end = 0usize;
-        let mut previous_id: &[u8] = &[];
-        for ordinal in 0..self.doc_count {
-            let start = read_u32(data, 8 + 4 * ordinal).ok_or("truncated id offset")? as usize;
-            let end = read_u32(data, 8 + 4 * (ordinal + 1)).ok_or("truncated id offset")? as usize;
-            if start != previous_end {
+        let blob_at = 8 + 4 * (self.doc_count + 1) + 4 * self.doc_count;
+        let blob_len = data.len().saturating_sub(blob_at);
+
+        // The offset array, walked over its own n+1 entries.
+        //
+        // The first version of this compared each document's start against the
+        // PREVIOUS document's end, which reads the same slot twice and is
+        // therefore an identity for every ordinal above zero. What actually
+        // needs to hold is that the array is non-decreasing, starts at 0 and
+        // ends at the blob's length: that makes every `blob[offsets[i]..
+        // offsets[i+1]]` slice well formed, which is what `encoded_id` assumes
+        // and what `bincode`'s trailing-byte tolerance otherwise turns into one
+        // document's score under another's id.
+        let mut previous = 0usize;
+        for ordinal in 0..=self.doc_count {
+            let offset = read_u32(data, 8 + 4 * ordinal).ok_or("truncated id offset")? as usize;
+            if ordinal == 0 && offset != 0 {
+                return Err(format!("the first document id starts at {offset}, not 0"));
+            }
+            if offset < previous {
                 return Err(format!(
-                    "document {ordinal} starts at {start}, leaving a gap or an overlap after {previous_end}"
+                    "the id offset for document {ordinal} goes backwards, {previous} to {offset}"
                 ));
             }
-            let ordinal_u32 = u32::try_from(ordinal).map_err(|_| "ordinal out of range")?;
-            let id = self
-                .encoded_id(ordinal_u32)
-                .ok_or("a document id runs past the table")?;
-            if id.len() != end - start {
-                return Err(format!("document {ordinal} has an inconsistent id length"));
+            if ordinal > 0 && offset == previous {
+                return Err(format!("document {} has a zero-length id", ordinal - 1));
             }
+            previous = offset;
+        }
+        if previous != blob_len {
+            return Err(format!(
+                "the document ids end at {previous} and the blob is {blob_len} bytes"
+            ));
+        }
+
+        // The ids, which must be STRICTLY increasing because `ordinal_of`
+        // binary-searches them; and the LENGTHS, which nothing checked before.
+        // `doc_length` is the bound the posting walk refuses runs against, so an
+        // unvalidated one made that bound only as strong as a u32 out of a torn
+        // file: one length of `0xFFFF_FFFF` let a single run ask for 17.2 GiB.
+        let mut previous_id: &[u8] = &[];
+        let mut length_sum = 0usize;
+        for ordinal in 0..self.doc_count {
+            let ordinal = u32::try_from(ordinal).map_err(|_| "ordinal out of range")?;
+            let id = self
+                .encoded_id(ordinal)
+                .ok_or("a document id runs past the table")?;
             if ordinal > 0 && id <= previous_id {
                 return Err(format!(
                     "document {ordinal} does not sort after {}, so the table is not searchable",
                     ordinal - 1
                 ));
             }
-            previous_end = end;
+            let doc_length = self
+                .doc_length(ordinal)
+                .ok_or("a document length runs past the table")?;
+            length_sum = length_sum
+                .checked_add(doc_length)
+                .ok_or("the document lengths overflow")?;
             previous_id = id;
         }
-        let blob_at = 8 + 4 * (self.doc_count + 1) + 4 * self.doc_count;
-        let blob_len = data.len().saturating_sub(blob_at);
-        if previous_end != blob_len {
+
+        // Two sections of one file have to agree about how many occurrences it
+        // holds. Every occurrence belongs to exactly one document, so the
+        // lengths sum to the header's total, and a torn file breaks that
+        // agreement rather than quietly widening the run bound.
+        if length_sum != self.total_doc_length {
             return Err(format!(
-                "the document ids end at {previous_end} and the blob is {blob_len} bytes"
+                "the document lengths sum to {length_sum} and the header declares {}",
+                self.total_doc_length
             ));
         }
         Ok(())
@@ -1016,12 +1094,24 @@ impl MappedSegment {
         // `df` is not bounded here and does not need to be: every iteration of
         // the walk consumes at least one byte of a bounded section, so an
         // inflated count terminates in a truncation error rather than looping.
+        //
+        // `occurrences` IS bounded, against the same total the document lengths
+        // are validated to sum to. It was read and discarded before, which
+        // wasted the one value in the format that ties a term's postings to the
+        // document table, and the cursor now spends it as a budget.
+        let total = u64::try_from(self.total_doc_length).map_err(|_| "segment total too large")?;
+        if occurrences > total {
+            return Err(format!(
+                "a term declares {occurrences} occurrences in a segment of {total}"
+            ));
+        }
         Ok((
             TermCursor {
                 segment: self,
                 pos,
                 remaining: df,
                 previous: -1,
+                budget: occurrences,
             },
             occurrences,
         ))
@@ -1087,6 +1177,123 @@ struct ScoringTerm {
     idf: f32,
     penalty: f32,
     slots: Vec<TermSlot>,
+}
+
+/// Map every segment the manifest names.
+fn open_segments(
+    storage_path: &Path,
+    manifest: &MappedManifest,
+    m_path: &Path,
+    archive_corrupt: bool,
+) -> Result<Vec<Option<MappedSegment>>, SearchError> {
+    let mut segments: Vec<Option<MappedSegment>> = Vec::with_capacity(manifest.segment_count);
+    for (segment, gen) in manifest.segment_gens.iter().enumerate() {
+        let Some(gen) = gen else {
+            segments.push(None);
+            continue;
+        };
+        let file = segment_path(storage_path, segment, *gen);
+        match MappedSegment::open(&file) {
+            Ok(mapped) => segments.push(Some(mapped)),
+            Err(reason) => {
+                return Err(corrupt_index_error(
+                    m_path,
+                    format!("segment {segment} gen {gen}: {reason}"),
+                    archive_corrupt,
+                ));
+            }
+        }
+    }
+    Ok(segments)
+}
+
+/// Make the manifest agree with the segments it names, or refuse.
+///
+/// Shared by both readers of a mapped image, and that is the point rather than a
+/// tidy-up. The hardening lived only in the mapped reader, while the ordinary
+/// load path is the one `TextIndex::open` actually calls, so the exact bytes one
+/// reader refused the other served: a manifest with a tombstone bit and a count
+/// of zero came back with one document fewer, no error, and the graph-root stamp
+/// still trusted, so a consumer keying freshness on that hash would keep a short
+/// index forever. Two readers of one image disagreeing about whether it is
+/// corrupt is worse than either verdict.
+///
+/// Three things, in order:
+///
+/// 1. Every tombstone count is recomputed from its own bits. The count and the
+///    bits gate different decisions, so a disagreement hides a document from
+///    results while still counting it in `N`, in `avgdl` and in every `df`.
+/// 2. A bit at or beyond a segment's document count is refused. It is
+///    unreachable by every read, so it cannot remove anything, but it makes
+///    `any()` true and drops every `live_df` for that segment off the O(1)
+///    stored count onto a full counted walk, for a removal that does not exist.
+/// 3. The documents and the token totals the segments hold, less what is
+///    tombstoned, must be what the manifest claims.
+fn reconcile(
+    m_path: &Path,
+    manifest: &mut MappedManifest,
+    segments: &[Option<MappedSegment>],
+    archive_corrupt: bool,
+) -> Result<(), SearchError> {
+    for tombstones in manifest.tombstones.iter_mut() {
+        tombstones.rebuild_count();
+    }
+
+    let mut mapped_docs = 0usize;
+    let mut mapped_length = 0usize;
+    let mut removed = 0usize;
+    let mut removed_length = 0usize;
+    for (segment, mapped) in segments.iter().enumerate() {
+        let Some(mapped) = mapped else { continue };
+        mapped_docs += mapped.doc_count;
+        mapped_length += mapped.total_doc_length;
+        let tombstones = &manifest.tombstones[segment];
+        if !tombstones.any() {
+            continue;
+        }
+        let reachable = tombstones.highest_set().unwrap_or(0);
+        if reachable >= mapped.doc_count {
+            return Err(corrupt_index_error(
+                m_path,
+                format!(
+                    "segment {segment} has a tombstone at ordinal {reachable} in a segment of {} \
+                     documents, which no read can reach",
+                    mapped.doc_count
+                ),
+                archive_corrupt,
+            ));
+        }
+        // Walked rather than taken from a stored count, so the check stays right
+        // once a commit starts publishing tombstones: a removed document's
+        // LENGTH has to come out of the total as well as its count, or `avgdl`
+        // drifts and every score in the corpus moves. One pass per removed
+        // ordinal, and zero for an image this build writes.
+        for ordinal in 0..mapped.doc_count {
+            let Ok(ordinal) = u32::try_from(ordinal) else {
+                break;
+            };
+            if !tombstones.is_set(ordinal) {
+                continue;
+            }
+            removed += 1;
+            removed_length += mapped.doc_length(ordinal).unwrap_or(0);
+        }
+    }
+    let expected_docs = mapped_docs.saturating_sub(removed);
+    let expected_length = mapped_length.saturating_sub(removed_length);
+    if expected_docs != manifest.doc_count || expected_length != manifest.total_doc_length {
+        return Err(corrupt_index_error(
+            m_path,
+            format!(
+                "the segments hold {mapped_docs} documents of {mapped_length} tokens with \
+                 {removed} documents of {removed_length} tokens tombstoned, which is \
+                 {expected_docs} of {expected_length}, and the manifest claims {} of {}",
+                manifest.doc_count, manifest.total_doc_length
+            ),
+            archive_corrupt,
+        ));
+    }
+    Ok(())
 }
 
 /// A text index answered from mapped segment files.
@@ -1176,80 +1383,9 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
             ));
         }
 
-        // Whatever the file claimed the tombstone counts were, they are the
-        // bits' own popcount from here on.
         let mut manifest = manifest;
-        for tombstones in manifest.tombstones.iter_mut() {
-            tombstones.rebuild_count();
-        }
-        let manifest = manifest;
-
-        let mut segments: Vec<Option<MappedSegment>> = Vec::with_capacity(manifest.segment_count);
-        for (segment, gen) in manifest.segment_gens.iter().enumerate() {
-            let Some(gen) = gen else {
-                segments.push(None);
-                continue;
-            };
-            let file = segment_path(&storage_path, segment, *gen);
-            match MappedSegment::open(&file) {
-                Ok(mapped) => segments.push(Some(mapped)),
-                Err(reason) => {
-                    return Err(corrupt_index_error(
-                        &m_path,
-                        format!("segment {segment} gen {gen}: {reason}"),
-                        false,
-                    ));
-                }
-            }
-        }
-
-        // The manifest is the commit point, so it has to agree with the files it
-        // names. A manifest paired with a stale or foreign segment set is the
-        // class the bincode loader already refuses by summing its segments, and
-        // it is refused here the same way rather than served as a short index.
-        let mut mapped_docs = 0usize;
-        let mut mapped_length = 0usize;
-        let mut removed = 0usize;
-        let mut removed_length = 0usize;
-        for (segment, mapped) in segments.iter().enumerate() {
-            let Some(mapped) = mapped else { continue };
-            mapped_docs += mapped.doc_count;
-            mapped_length += mapped.total_doc_length;
-            // Walked rather than taken from a stored count, so the check stays
-            // right once a commit starts publishing tombstones: a removed
-            // document's LENGTH has to come out of the total as well as its
-            // count, or `avgdl` drifts and every score in the corpus moves. The
-            // cost is one pass per removed ordinal, and zero for an image this
-            // build writes.
-            let tombstones = &manifest.tombstones[segment];
-            if !tombstones.any() {
-                continue;
-            }
-            for ordinal in 0..mapped.doc_count {
-                let Ok(ordinal) = u32::try_from(ordinal) else {
-                    break;
-                };
-                if !tombstones.is_set(ordinal) {
-                    continue;
-                }
-                removed += 1;
-                removed_length += mapped.doc_length(ordinal).unwrap_or(0);
-            }
-        }
-        let expected_docs = mapped_docs.saturating_sub(removed);
-        let expected_length = mapped_length.saturating_sub(removed_length);
-        if expected_docs != manifest.doc_count || expected_length != manifest.total_doc_length {
-            return Err(corrupt_index_error(
-                &m_path,
-                format!(
-                    "the segments hold {mapped_docs} documents of {mapped_length} tokens with \
-                     {removed} documents of {removed_length} tokens tombstoned, which is \
-                     {expected_docs} of {expected_length}, and the manifest claims {} of {}",
-                    manifest.doc_count, manifest.total_doc_length
-                ),
-                false,
-            ));
-        }
+        let segments = open_segments(&storage_path, &manifest, &m_path, false)?;
+        reconcile(&m_path, &mut manifest, &segments, false)?;
 
         Ok(Self {
             segments,
@@ -1697,7 +1833,7 @@ pub(crate) fn rehydrate<Id: DocId + Serialize + DeserializeOwned>(
     archive_corrupt: bool,
 ) -> Result<crate::LoadedSegmented<Id>, SearchError> {
     let m_path = manifest_path(storage_path);
-    let manifest: MappedManifest = bincode::deserialize(manifest_bytes).map_err(|err| {
+    let mut manifest: MappedManifest = bincode::deserialize(manifest_bytes).map_err(|err| {
         corrupt_index_error(
             &m_path,
             format!("undecodable mapped manifest: {err}"),
@@ -1729,6 +1865,13 @@ pub(crate) fn rehydrate<Id: DocId + Serialize + DeserializeOwned>(
         ));
     }
 
+    // The SAME reconciliation the mapped reader runs, on the same image. This
+    // path is the one `TextIndex::open` actually calls, so leaving the
+    // hardening on the other side of the fork meant the load-bearing reader was
+    // the unhardened one.
+    let segments = open_segments(storage_path, &manifest, &m_path, archive_corrupt)?;
+    reconcile(&m_path, &mut manifest, &segments, archive_corrupt)?;
+
     let mut index: HashMap<String, Postings<Id>> = HashMap::new();
     let mut docs: HashMap<Id, crate::IndexedDoc> = HashMap::new();
     let mut vocab = crate::Vocabulary::default();
@@ -1737,17 +1880,15 @@ pub(crate) fn rehydrate<Id: DocId + Serialize + DeserializeOwned>(
     let mut doc_count = 0usize;
     let mut total_doc_length = 0usize;
 
-    for (segment, gen) in manifest.segment_gens.iter().enumerate() {
-        let Some(gen) = gen else { continue };
-        let file = segment_path(storage_path, segment, *gen);
+    for (segment, mapped) in segments.iter().enumerate() {
+        let Some(mapped) = mapped else { continue };
         let fail = |reason: String| {
             corrupt_index_error(
                 &m_path,
-                format!("segment {segment} gen {gen}: {reason}"),
+                format!("segment {segment}: {reason}"),
                 archive_corrupt,
             )
         };
-        let mapped = MappedSegment::open(&file).map_err(fail)?;
         let tombstones = &manifest.tombstones[segment];
 
         // Live documents first, so a posting naming a tombstoned ordinal is
@@ -1811,6 +1952,22 @@ pub(crate) fn rehydrate<Id: DocId + Serialize + DeserializeOwned>(
                 }
             }
         }
+    }
+
+    // The reconciliation above proved these against the segments, so the
+    // manifest's are the ones to carry. Recomputing them here and returning the
+    // recomputation is how this path silently repaired a disagreement the other
+    // reader refuses.
+    if doc_count != manifest.doc_count || total_doc_length != manifest.total_doc_length {
+        return Err(corrupt_index_error(
+            &m_path,
+            format!(
+                "the walk found {doc_count} live documents of {total_doc_length} tokens and the \
+                 reconciled manifest says {} of {}",
+                manifest.doc_count, manifest.total_doc_length
+            ),
+            archive_corrupt,
+        ));
     }
 
     Ok(crate::LoadedSegmented {
@@ -2308,6 +2465,111 @@ mod tests {
         );
     }
 
+    /// Neither writer may rename onto a name the live manifest holds.
+    ///
+    /// The mapped writer learned to read the live manifest's generations and
+    /// write past them; the bincode writer was not taught anything, and its
+    /// `unwrap_or(0)` for a missing baseline picks exactly the generation the
+    /// mapped writer picks on an empty directory. So a commit with no baseline
+    /// renamed v4 bytes onto the very names a live v5 manifest held, before the
+    /// v4 manifest replaced it. A crash or a concurrent reader in that window
+    /// finds a manifest naming files of the other format, and because the index
+    /// is derived the recovery is to archive it and rebuild.
+    ///
+    /// Two ways in, and both are reached through a baseline THIS build clears on
+    /// purpose, so both arms are here. Asserted as path disjointness rather than
+    /// by simulating a crash, because disjointness is the property that makes
+    /// the manifest the only commit point.
+    #[test]
+    fn no_writer_renames_onto_a_name_the_live_manifest_holds() {
+        let docs = corpus();
+
+        // Arm one: a mapped image, loaded on the ordinary path, then committed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = dir.path().join("index.bin");
+        let heap = heap_index(&docs);
+        heap.seg.write().segment_count = 4;
+        heap.persist_mapped(&storage).expect("persist_mapped");
+        let live = paths_named(&storage);
+        assert!(!live.is_empty(), "the mapped write must name some segments");
+
+        let reopened: TextIndex<Key> = TextIndex::open(Some(&storage)).expect("open");
+        reopened
+            .upsert_searchable(Key(8_001), &after_doc("armOne"))
+            .expect("upsert");
+        reopened.commit().expect("commit");
+        let after = paths_named(&storage);
+        assert!(!after.is_empty(), "the commit must name some segments");
+        for path in &after {
+            assert!(
+                !live.contains(path),
+                "arm one: the commit published {}, which the live mapped manifest already named",
+                path.display()
+            );
+        }
+        let back: TextIndex<Key> = TextIndex::open(Some(&storage)).expect("reopen");
+        assert_eq!(back.live_document_count(), docs.len() + 1);
+
+        // Arm two: no v5 file at this path at all. A mapped write to a DIFFERENT
+        // path clears this one's baseline, and the next commit here must still
+        // not land on its own live names.
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        let a = dir_a.path().join("index.bin");
+        let index: TextIndex<Key> = TextIndex::open(Some(&a)).expect("open a");
+        index.seg.write().segment_count = 4;
+        for (id, doc) in docs.iter().take(16) {
+            index.upsert_searchable(*id, doc).expect("upsert");
+        }
+        index.commit().expect("commit a");
+        let live_a = paths_named(&a);
+        assert!(
+            !live_a.is_empty(),
+            "the bincode commit must name some segments"
+        );
+
+        index
+            .persist_mapped(dir_b.path())
+            .expect("persist_mapped b");
+        index
+            .upsert_searchable(Key(8_002), &after_doc("armTwo"))
+            .expect("upsert");
+        index.commit().expect("second commit a");
+        let after_a = paths_named(&a);
+        assert!(
+            !after_a.is_empty(),
+            "the second commit must name some segments"
+        );
+        for path in &after_a {
+            assert!(
+                !live_a.contains(path),
+                "arm two: the commit published {}, which its own live manifest already named",
+                path.display()
+            );
+        }
+        let back_a: TextIndex<Key> = TextIndex::open(Some(&a)).expect("reopen a");
+        assert_eq!(back_a.live_document_count(), 17);
+    }
+
+    /// The segment files a manifest at `storage` names, whichever shape it is.
+    fn paths_named(storage: &Path) -> Vec<PathBuf> {
+        let resolved = crate::storage_file_path_for(storage);
+        read_manifest_gens(&resolved)
+            .iter()
+            .enumerate()
+            .filter_map(|(segment, gen)| gen.map(|gen| segment_path(&resolved, segment, gen)))
+            .collect()
+    }
+
+    fn after_doc(name: &str) -> Doc {
+        Doc {
+            name: name.to_string(),
+            signature: format!("fn {name}(input: &str) -> Result<(), Error>"),
+            body: format!("{name} shared shared shared handler for {name} in module after"),
+            kind: "Function".to_string(),
+        }
+    }
+
     /// A mapped write over a bincode baseline must not leave the next ordinary
     /// commit able to publish a manifest that names files of the other format.
     ///
@@ -2424,6 +2686,35 @@ mod tests {
             format!("{error}").contains("tombstoned"),
             "the refusal must name the reconciliation, got: {error}"
         );
+
+        // The SAME bytes must be refused on the ordinary load path, which is
+        // the one `TextIndex::open` actually calls. The hardening lived only in
+        // the mapped reader for a round, so this exact image opened there with
+        // one document fewer, no error, and the graph-root stamp still trusted.
+        assert!(
+            TextIndex::<Key>::open(Some(&storage)).is_err(),
+            "the ordinary load path must refuse what the mapped reader refuses"
+        );
+
+        // And a bit past the segment's document count: unreachable by every
+        // read, so it removes nothing, but it makes `any()` true and drops every
+        // `df` in that segment off the O(1) stored count onto a counted walk.
+        let bytes = std::fs::read(&m_path).expect("read manifest");
+        let mut manifest: MappedManifest = bincode::deserialize(&bytes).expect("decode manifest");
+        let segment = manifest
+            .segment_gens
+            .iter()
+            .position(Option::is_some)
+            .expect("some segment has a file");
+        manifest.tombstones[segment] = Tombstones::for_docs(4096);
+        manifest.tombstones[segment].set(4095);
+        std::fs::write(&m_path, bincode::serialize(&manifest).expect("encode")).expect("write");
+        let error = MappedIndex::<Key>::open(dir.path())
+            .expect_err("an unreachable tombstone must be refused");
+        assert!(
+            format!("{error}").contains("no read can reach"),
+            "the refusal must name it, got: {error}"
+        );
     }
 
     /// The reverse direction's length floor must be the predicate's own floor.
@@ -2436,6 +2727,72 @@ mod tests {
     /// wrong form went in and a table caught it.
     #[test]
     fn the_reverse_floor_is_the_predicates_own_floor() {
+        // The enumeration itself, first. The arithmetic comparison below is a
+        // check on `reverse_substring_admits`, which this round did not touch,
+        // so on its own it stayed green with the floor reverted: no byte in it
+        // reached `reverse_substring_candidates`. This half does.
+        let docs = corpus();
+        let heap = heap_index(&docs);
+        heap.seg.write().segment_count = 2;
+        let dir = tempfile::tempdir().expect("tempdir");
+        heap.persist_mapped(dir.path()).expect("persist_mapped");
+        let mapped: MappedIndex<Key> = MappedIndex::open(dir.path()).expect("open mapped");
+
+        let mut exercised_differing = 0usize;
+        for query in [
+            "users",
+            "userna",
+            "usernames",
+            "definitely",
+            "renderwidget",
+            "abcde",
+            "abcdef",
+            "abcdefghi",
+            "abcdefghij",
+            "abcdefghijklm",
+            "abcdefghijklmn",
+        ] {
+            let correct = MIN_SUBSTRING_LEN.max((query.len() * 3).div_ceil(4));
+            let wrong = MIN_SUBSTRING_LEN.max(query.len().div_ceil(4) * 3);
+            if wrong != correct {
+                exercised_differing += 1;
+            }
+            // Brute force over EVERY start and end pair with the predicate
+            // applied. That is the set the bound must not change, so a bound
+            // that skips a length the predicate accepts makes the real answer a
+            // strict subset of this and the assertion fails.
+            let bytes = query.as_bytes();
+            let mut want: BTreeSet<Vec<u8>> = BTreeSet::new();
+            for start in 0..bytes.len() {
+                for end in (start + 1)..=bytes.len() {
+                    let candidate = &bytes[start..end];
+                    if candidate == bytes || candidate.len() < MIN_SUBSTRING_LEN {
+                        continue;
+                    }
+                    let Ok(text) = std::str::from_utf8(candidate) else {
+                        continue;
+                    };
+                    if reverse_substring_admits(query, text) {
+                        want.insert(candidate.to_vec());
+                    }
+                }
+            }
+            assert_eq!(
+                mapped.reverse_substring_candidates(query),
+                want,
+                "the bounded enumeration for {query:?} differs from a full start-and-end scan"
+            );
+            assert!(
+                !want.is_empty(),
+                "{query:?} produced no candidates at all, so it tests nothing"
+            );
+        }
+        assert!(
+            exercised_differing >= 4,
+            "only {exercised_differing} of the queries sit at a length where the two floor forms \
+             differ, so the enumeration half proves little"
+        );
+
         let mut differing = 0usize;
         for query_len in MIN_SUBSTRING_LEN..200usize {
             let floor = MIN_SUBSTRING_LEN.max((query_len * 3).div_ceil(4));
@@ -2816,6 +3173,20 @@ mod tests {
                 "{value} left {} bytes unread",
                 buf.len() - pos
             );
+            // A non-canonical encoding of the SAME value must be refused, or
+            // two byte strings map to one and a corruption signal is thrown
+            // away. Setting the continuation bit on the last byte and appending
+            // a zero is the general over-long form.
+            let mut over_long = buf.clone();
+            let last = over_long.len() - 1;
+            over_long[last] |= 0x80;
+            over_long.push(0x00);
+            let mut pos = 0usize;
+            assert_eq!(
+                get_uvarint(&over_long, &mut pos),
+                None,
+                "the over-long encoding of {value} decoded anyway"
+            );
             // Truncation must report itself rather than return a short value.
             if buf.len() > 1 {
                 let mut pos = 0usize;
@@ -2913,6 +3284,60 @@ mod tests {
                 || message.contains("does not sort after"),
             "the refusal must name the table, got: {message}"
         );
+
+        // The document table, poked one field at a time. Every check in
+        // `validate_document_table` gets an arm, because the first version of
+        // that pass had a contiguity check that read the same slot twice and was
+        // therefore an identity for every ordinal above zero.
+        let doc_count = read_u64(&intact, 16).expect("doc count") as usize;
+        assert!(
+            doc_count > 4,
+            "the fixture segment must hold enough documents to poke the middle of the table"
+        );
+        let offsets_at = docs_off + 8;
+        let lengths_at = docs_off + 8 + 4 * (doc_count + 1);
+
+        for (label, at, value, expect) in [
+            (
+                "offsets going backwards",
+                offsets_at + 4 * 3,
+                read_u32(&intact, offsets_at + 4 * 2).expect("offset") - 1,
+                "goes backwards",
+            ),
+            (
+                "the first offset not zero",
+                offsets_at,
+                4u32,
+                "starts at 4, not 0",
+            ),
+            (
+                "a terminal offset short of the blob",
+                offsets_at + 4 * doc_count,
+                read_u32(&intact, offsets_at + 4 * doc_count).expect("offset") - 4,
+                "and the blob is",
+            ),
+            (
+                "a zero-length id",
+                offsets_at + 4 * 3,
+                read_u32(&intact, offsets_at + 4 * 2).expect("offset"),
+                "zero-length id",
+            ),
+            (
+                "a document length the header's total denies",
+                lengths_at,
+                read_u32(&intact, lengths_at).expect("length") + 7,
+                "the document lengths sum to",
+            ),
+        ] {
+            let mut torn = intact.clone();
+            torn[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            std::fs::write(&seg_file, &torn).expect("write");
+            let error = MappedIndex::<Key>::open(dir.path()).expect_err(label);
+            assert!(
+                format!("{error}").contains(expect),
+                "{label}: the refusal must name it, got: {error}"
+            );
+        }
 
         // A weight count of 2^63 at the head of the postings section. The
         // postings are not validated at open, deliberately, so this is refused

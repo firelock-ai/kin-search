@@ -2229,9 +2229,28 @@ where
             }
         }
 
+        // With no in-memory baseline, the generations come off DISK rather than
+        // from a vector of `None`.
+        //
+        // `None` here used to mean "start at 0", and 0 is exactly the generation
+        // the mapped writer picks on an empty directory. So a commit with no
+        // baseline renamed v4 bytes onto the very names a live v5 manifest held,
+        // before the v4 manifest replaced it. A crash or a concurrent reader in
+        // that window finds a manifest naming files of the other format, and
+        // since the index is derived the recovery is to archive it and rebuild:
+        // the corpus is gone. Two ways in, and both reach it through a baseline
+        // this build clears on purpose, one after a mapped image is loaded and
+        // one after a mapped image is written to a different path.
+        //
+        // Reading the live manifest is the general invariant: no writer renames
+        // onto a name the live manifest holds, whichever format wrote it.
         let old_gens: Vec<Option<u64>> = match &seg.baseline_gens {
             Some(gens) => gens.clone(),
-            None => vec![None; segment_count],
+            None => {
+                let mut on_disk = mapped::read_manifest_gens(path);
+                on_disk.resize(segment_count, None);
+                on_disk
+            }
         };
         let mut new_gens = old_gens.clone();
 
