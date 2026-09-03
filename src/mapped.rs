@@ -1537,11 +1537,27 @@ impl<Id: DocId> MappedIndex<Id> {
 }
 
 impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
-    /// Open a mapped index written by [`write_mapped`].
+    /// Open a mapped index written by [`write_mapped`], without touching the
+    /// files on disk if it is corrupt.
     ///
     /// `path` is the same storage path the bincode formats use; the manifest and
     /// the segment files are its siblings.
     pub fn open(path: &Path) -> Result<Self, SearchError> {
+        Self::open_archiving(path, false)
+    }
+
+    /// The same, but archiving a corrupt manifest aside when `archive_corrupt`.
+    ///
+    /// The distinction is the crate's whole recovery posture and it is not
+    /// cosmetic. A text index is DERIVED from graph-owned truth, so the answer
+    /// to a corrupt one is to move it aside and rebuild, and a reader that
+    /// refuses without archiving leaves a store that can never recover on its
+    /// own: every subsequent open meets the same bytes and refuses again.
+    ///
+    /// So a writing open archives and a read-only open does not, because a
+    /// read-only handle must not rename files. `TextIndex::open` passes its own
+    /// write-mode flag straight through.
+    pub fn open_archiving(path: &Path, archive_corrupt: bool) -> Result<Self, SearchError> {
         let storage_path = crate::storage_file_path_for(path);
         let m_path = manifest_path(&storage_path);
         let bytes = std::fs::read(&m_path).map_err(|err| {
@@ -1554,7 +1570,7 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
             return Err(corrupt_index_error(
                 &m_path,
                 format!("truncated manifest ({} bytes)", bytes.len()),
-                false,
+                archive_corrupt,
             ));
         }
         // The leading `version: u32` is read as raw little-endian bytes before
@@ -1568,11 +1584,15 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
                     "manifest version {version} is not the mapped layout; \
                      the mapped reader serves version {MAPPED_SEGMENT_VERSION} only"
                 ),
-                false,
+                archive_corrupt,
             ));
         }
         let manifest: MappedManifest = bincode::deserialize(&bytes).map_err(|err| {
-            corrupt_index_error(&m_path, format!("undecodable manifest: {err}"), false)
+            corrupt_index_error(
+                &m_path,
+                format!("undecodable manifest: {err}"),
+                archive_corrupt,
+            )
         })?;
         if manifest.version != version {
             return Err(corrupt_index_error(
@@ -1581,7 +1601,7 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
                     "declared version {version} but decoded version {}",
                     manifest.version
                 ),
-                false,
+                archive_corrupt,
             ));
         }
         if manifest.segment_gens.len() != manifest.segment_count
@@ -1595,13 +1615,13 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
                     manifest.segment_gens.len(),
                     manifest.tombstones.len()
                 ),
-                false,
+                archive_corrupt,
             ));
         }
 
         let mut manifest = manifest;
-        let segments = open_segments(&storage_path, &manifest, &m_path, false)?;
-        reconcile(&m_path, &mut manifest, &segments, false)?;
+        let segments = open_segments(&storage_path, &manifest, &m_path, archive_corrupt)?;
+        reconcile(&m_path, &mut manifest, &segments, archive_corrupt)?;
 
         Ok(Self {
             segments,

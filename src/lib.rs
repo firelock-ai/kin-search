@@ -2113,7 +2113,10 @@ where
             // left absent, because a v4 commit must never publish a manifest
             // naming v5 files.
             if version_of_manifest(&storage_path) == Some(MAPPED_SEGMENT_VERSION) {
-                let mapped = MappedIndex::open(&storage_path)?;
+                // The write-mode flag straight through: a writing open
+                // archives a corrupt manifest so the store can recover, a
+                // read-only one must not rename files.
+                let mapped = MappedIndex::open_archiving(&storage_path, persist_changes)?;
                 let segment_count = mapped.segment_count().max(1);
                 *index.graph_root_hash.write() = mapped.graph_root_hash();
                 *index.mapped.write() = Some(mapped);
