@@ -88,9 +88,11 @@ use crate::{
 /// postings and a document table, in one immutable file per segment.
 ///
 /// Reading is a range and writing is a point, the same split the v3-to-v4 move
-/// established. This build READS 3 through 5 and its default commit still WRITES
-/// 4; a v5 image is produced only by an explicit
-/// [`persist_mapped`](crate::TextIndex::persist_mapped).
+/// established. This build READS 3 through 5 and WRITES only 5: the default
+/// commit converts a heap store to this layout and a store already on it
+/// rewrites itself through `commit_mapped`. The bincode segmented writer that
+/// produced 4 is gone, so the legacy range is a reader's range only, kept
+/// because every store in the field is 3 or 4 and has to open.
 pub const MAPPED_SEGMENT_VERSION: u32 = 5;
 
 /// Magic at the head of every mapped segment file. Read before anything else, so
@@ -2724,14 +2726,15 @@ mod tests {
         // the mapped reader has to say so rather than decode it. `bincode`
         // allows trailing bytes, so a version check is the only thing standing
         // between two manifest shapes and a silently wrong index.
+        //
+        // The manifest is hand-written. This arm used to get one by committing,
+        // which stopped producing v4 the moment the default commit wrote v5:
+        // the reader then opened its own format and the arm failed on a fixture
+        // rather than on the property. A refusal test has to be handed the thing
+        // it refuses.
         let bincode_dir = tempfile::tempdir().expect("tempdir");
         let bincode_storage = bincode_dir.path().join("index.bin");
-        let persisted: TextIndex<Key> =
-            TextIndex::open(Some(&bincode_storage)).expect("open for write");
-        for (id, doc) in &docs {
-            persisted.upsert_searchable(*id, doc).expect("upsert");
-        }
-        persisted.commit().expect("commit");
+        write_legacy_manifest(&bincode_storage, &[Some(0); 4]);
         let error = MappedIndex::<Key>::open(&bincode_storage)
             .expect_err("the mapped reader must refuse a bincode manifest");
         assert!(
@@ -2740,90 +2743,253 @@ mod tests {
         );
     }
 
-    /// Neither writer may rename onto a name the live manifest holds.
+    /// No writer may change the bytes behind a name the live manifest holds.
     ///
-    /// The mapped writer learned to read the live manifest's generations and
-    /// write past them; the bincode writer was not taught anything, and its
-    /// `unwrap_or(0)` for a missing baseline picks exactly the generation the
-    /// mapped writer picks on an empty directory. So a commit with no baseline
-    /// renamed v4 bytes onto the very names a live v5 manifest held, before the
-    /// v4 manifest replaced it. A crash or a concurrent reader in that window
-    /// finds a manifest naming files of the other format, and because the index
-    /// is derived the recovery is to archive it and rebuild.
+    /// The manifest is the only commit point, so every name it currently holds
+    /// has to keep reading correctly right up to the moment a new manifest
+    /// replaces it. A writer that renamed fresh bytes onto a live name breaks
+    /// that: a crash or a concurrent reader in the window between the segment
+    /// write and the manifest promotion finds a manifest naming files it never
+    /// wrote, and because the index is derived the recovery is to archive it and
+    /// rebuild.
     ///
-    /// Two ways in, and both are reached through a baseline THIS build clears on
-    /// purpose, so both arms are here. Asserted as path disjointness rather than
-    /// by simulating a crash, because disjointness is the property that makes
-    /// the manifest the only commit point.
+    /// Stated as byte stability rather than as path disjointness, and the
+    /// difference is the carry. A commit rewrites only the segments its delta
+    /// reaches and names the rest at the generation they already have, so a
+    /// reused name is expected and correct; what must never happen is a reused
+    /// name whose CONTENT moved. Disjointness would forbid the carry itself,
+    /// which is the whole reason a one-document commit stopped re-encoding
+    /// sixty-four segments.
+    ///
+    /// Both writers that publish a manifest are here: `write_mapped`, which
+    /// rewrites every segment, and `write_mapped_streaming` under
+    /// `commit_mapped`, which carries what the delta did not touch. Both take
+    /// the generation from the manifest ON DISK and from nothing in memory, so
+    /// arm two hands the store to a handle that has never seen it and it must
+    /// still write past what is there.
     #[test]
-    fn no_writer_renames_onto_a_name_the_live_manifest_holds() {
+    fn no_writer_changes_the_bytes_behind_a_live_name() {
         let docs = corpus();
 
-        // Arm one: a mapped image, loaded on the ordinary path, then committed.
+        // Arm one: a commit onto a mapped image. One document changes, so one
+        // segment is rewritten and every other one is carried.
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = dir.path().join("index.bin");
         let heap = heap_index(&docs);
         heap.seg.write().segment_count = 4;
         heap.persist_mapped(&storage).expect("persist_mapped");
-        let live = paths_named(&storage);
-        assert!(!live.is_empty(), "the mapped write must name some segments");
+        let before = image_named(&storage);
+        assert!(
+            before.len() > 1,
+            "arm one needs more than one populated segment or the carry proves nothing, got {}",
+            before.len()
+        );
 
         let reopened: TextIndex<Key> = TextIndex::open(Some(&storage)).expect("open");
         reopened
             .upsert_searchable(Key(8_001), &after_doc("armOne"))
             .expect("upsert");
         reopened.commit().expect("commit");
-        let after = paths_named(&storage);
-        assert!(!after.is_empty(), "the commit must name some segments");
-        for path in &after {
-            assert!(
-                !live.contains(path),
-                "arm one: the commit published {}, which the live mapped manifest already named",
-                path.display()
-            );
-        }
+        let after = image_named(&storage);
+        let fresh = assert_no_live_name_moved("arm one", &before, &after);
+        assert_eq!(
+            fresh, 1,
+            "arm one: a delta of one document reaches one segment, so exactly one name is new"
+        );
+        assert!(
+            after.len() - fresh > 0,
+            "arm one: the segments the delta did not reach must be carried under the names they \
+             already hold, and none was"
+        );
         let back: TextIndex<Key> = TextIndex::open(Some(&storage)).expect("reopen");
         assert_eq!(back.live_document_count(), docs.len() + 1);
 
-        // Arm two: no v5 file at this path at all. A mapped write to a DIFFERENT
-        // path clears this one's baseline, and the next commit here must still
-        // not land on its own live names.
-        let dir_a = tempfile::tempdir().expect("tempdir");
-        let dir_b = tempfile::tempdir().expect("tempdir");
-        let a = dir_a.path().join("index.bin");
-        let index: TextIndex<Key> = TextIndex::open(Some(&a)).expect("open a");
-        index.seg.write().segment_count = 4;
-        for (id, doc) in docs.iter().take(16) {
-            index.upsert_searchable(*id, doc).expect("upsert");
-        }
-        index.commit().expect("commit a");
-        let live_a = paths_named(&a);
-        assert!(
-            !live_a.is_empty(),
-            "the bincode commit must name some segments"
-        );
+        // Arm two: a handle that has never seen this store writes over it. The
+        // generation is read off the manifest on disk, so a writer carrying no
+        // baseline of its own must still land past what is already there.
+        let dir_two = tempfile::tempdir().expect("tempdir");
+        let storage_two = dir_two.path().join("index.bin");
+        let first = heap_index(&docs);
+        first.seg.write().segment_count = 4;
+        first
+            .persist_mapped(&storage_two)
+            .expect("first persist_mapped");
+        let before_two = image_named(&storage_two);
 
-        index
-            .persist_mapped(dir_b.path())
-            .expect("persist_mapped b");
-        index
+        let stranger = heap_index(&docs);
+        stranger
             .upsert_searchable(Key(8_002), &after_doc("armTwo"))
             .expect("upsert");
-        index.commit().expect("second commit a");
-        let after_a = paths_named(&a);
-        assert!(
-            !after_a.is_empty(),
-            "the second commit must name some segments"
+        stranger.commit().expect("commit the stranger's heap");
+        stranger.seg.write().segment_count = 4;
+        stranger
+            .persist_mapped(&storage_two)
+            .expect("second persist_mapped");
+        let after_two = image_named(&storage_two);
+        let fresh_two = assert_no_live_name_moved("arm two", &before_two, &after_two);
+        assert_eq!(
+            fresh_two,
+            after_two.len(),
+            "arm two: this writer rewrites every segment, so every name it publishes is new"
         );
-        for path in &after_a {
-            assert!(
-                !live_a.contains(path),
-                "arm two: the commit published {}, which its own live manifest already named",
-                path.display()
-            );
+        let back_two: TextIndex<Key> = TextIndex::open(Some(&storage_two)).expect("reopen two");
+        assert_eq!(back_two.live_document_count(), docs.len() + 1);
+
+        // Arm three: the loop a daemon runs. The first commit at a path converts
+        // the heap into a mapped image, the second is a delta onto that mapping,
+        // and both are writers that must leave the live names alone.
+        let dir_three = tempfile::tempdir().expect("tempdir");
+        let storage_three = dir_three.path().join("index.bin");
+        let store: TextIndex<Key> = TextIndex::open(Some(&storage_three)).expect("open three");
+        store.seg.write().segment_count = 4;
+        for (id, doc) in docs.iter().take(16) {
+            store.upsert_searchable(*id, doc).expect("upsert");
         }
-        let back_a: TextIndex<Key> = TextIndex::open(Some(&a)).expect("reopen a");
-        assert_eq!(back_a.live_document_count(), 17);
+        store.commit().expect("first commit");
+        let before_three = image_named(&storage_three);
+        assert!(
+            !before_three.is_empty(),
+            "arm three: the first commit must publish an image"
+        );
+
+        store
+            .upsert_searchable(Key(8_003), &after_doc("armThree"))
+            .expect("upsert");
+        store.commit().expect("second commit");
+        let after_three = image_named(&storage_three);
+        assert_no_live_name_moved("arm three", &before_three, &after_three);
+        let back_three: TextIndex<Key> =
+            TextIndex::open(Some(&storage_three)).expect("reopen three");
+        assert_eq!(back_three.live_document_count(), 17);
+
+        // Arm four: the live manifest is a v4 one. `segment_path` is ONE
+        // namespace shared by v3, v4 and v5, so a v5 write onto a path a legacy
+        // manifest still owns has to count that manifest's generations too. It
+        // is the reason `read_manifest_gens` decodes the legacy range at all,
+        // and with the v4 writer deleted this is the only thing exercising it.
+        let dir_four = tempfile::tempdir().expect("tempdir");
+        let storage_four = dir_four.path().join("index.bin");
+        let legacy = write_legacy_manifest(&storage_four, &[Some(7); 4]);
+
+        let over = heap_index(&docs);
+        over.seg.write().segment_count = 4;
+        over.persist_mapped(&storage_four).expect("persist over v4");
+        let after_four = image_named(&storage_four);
+        let fresh_four = assert_no_live_name_moved("arm four", &legacy, &after_four);
+        assert_eq!(
+            fresh_four,
+            after_four.len(),
+            "arm four: every name a v5 write publishes over a v4 manifest must be new"
+        );
+        // And it read the generations rather than dodging them by luck: 7 was on
+        // disk, so 8 is the only answer a writer that read it can give. Starting
+        // from 0, which is what ignoring a legacy manifest looks like, lands on
+        // names that manifest does not hold and would pass the check above.
+        let resolved_four = crate::storage_file_path_for(&storage_four);
+        let gens: Vec<u64> = read_manifest_gens(&resolved_four)
+            .into_iter()
+            .flatten()
+            .collect();
+        assert!(
+            !gens.is_empty(),
+            "arm four: the write must name some segments"
+        );
+        assert!(
+            gens.iter().all(|gen| *gen == 8),
+            "arm four: the v4 manifest named generation 7, so the v5 write must name 8, got {gens:?}"
+        );
+    }
+
+    /// A v3/v4 bincode manifest at `storage` naming `gens`, with a byte fixture
+    /// behind every name it holds. Returns those names and their bytes.
+    ///
+    /// Hand-written because this build has no v4 writer: `21d26b6` deleted it
+    /// and a commit produces v5. What matters to the writer under test is the
+    /// manifest, which is what `read_manifest_gens` decodes, so the segment
+    /// files behind it are byte fixtures rather than real segments.
+    fn write_legacy_manifest(storage: &Path, gens: &[Option<u64>]) -> BTreeMap<PathBuf, Vec<u8>> {
+        let resolved = crate::storage_file_path_for(storage);
+        if let Some(parent) = resolved.parent() {
+            std::fs::create_dir_all(parent).expect("create the store directory");
+        }
+        let mut named = BTreeMap::new();
+        for (segment, gen) in gens.iter().enumerate() {
+            let Some(gen) = gen else { continue };
+            let path = segment_path(&resolved, segment, *gen);
+            let bytes = format!("legacy segment {segment} generation {gen}").into_bytes();
+            std::fs::write(&path, &bytes).expect("write the legacy segment fixture");
+            named.insert(path, bytes);
+        }
+        let manifest = crate::SegmentManifest {
+            version: crate::SEGMENTED_FORMAT_VERSION,
+            segment_count: gens.len(),
+            segment_gens: gens.to_vec(),
+            doc_count: 0,
+            total_doc_length: 0,
+            graph_root_hash: None,
+        };
+        std::fs::write(
+            manifest_path(&resolved),
+            bincode::serialize(&manifest).expect("encode the legacy manifest"),
+        )
+        .expect("write the legacy manifest");
+        named
+    }
+
+    /// The segment files a manifest at `storage` names, with the bytes behind
+    /// each. Reading the bytes is the point: a name the next manifest still
+    /// holds has to still hold what it held.
+    fn image_named(storage: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        paths_named(storage)
+            .into_iter()
+            .map(|path| {
+                let bytes = std::fs::read(&path).unwrap_or_else(|err| {
+                    panic!(
+                        "the live manifest names {}, which cannot be read: {err}",
+                        path.display()
+                    )
+                });
+                (path, bytes)
+            })
+            .collect()
+    }
+
+    /// Every name the new manifest shares with the old one holds the bytes it
+    /// held before, and the write published at least one name the old manifest
+    /// did not hold. Returns how many names are new, so a caller can say what it
+    /// expected the writer to rewrite.
+    fn assert_no_live_name_moved(
+        arm: &str,
+        before: &BTreeMap<PathBuf, Vec<u8>>,
+        after: &BTreeMap<PathBuf, Vec<u8>>,
+    ) -> usize {
+        assert!(
+            !after.is_empty(),
+            "{arm}: the write must name some segments"
+        );
+        let mut fresh = 0usize;
+        for (path, bytes) in after {
+            match before.get(path) {
+                // Compared with `assert!` rather than `assert_eq!` so a failure
+                // reports the name and the sizes instead of dumping two segment
+                // images into the log.
+                Some(was) => assert!(
+                    was == bytes,
+                    "{arm}: the write put {} bytes behind {}, which the live manifest already \
+                     named holding {}",
+                    bytes.len(),
+                    path.display(),
+                    was.len()
+                ),
+                None => fresh += 1,
+            }
+        }
+        assert!(
+            fresh > 0,
+            "{arm}: the write published no name the live manifest did not already hold, so it \
+             wrote nothing at all"
+        );
+        fresh
     }
 
     /// The segment files a manifest at `storage` names, whichever shape it is.
@@ -2845,78 +3011,23 @@ mod tests {
         }
     }
 
-    /// A mapped write over a bincode baseline must not leave the next ordinary
-    /// commit able to publish a manifest that names files of the other format.
-    ///
-    /// The sequence that lost a corpus: a v4 commit establishes a baseline at
-    /// generation 0 and leaves `dirty` tracked-empty; a mapped write lands v5
-    /// bytes and a v5 manifest; the next ordinary commit is then a DELTA, so it
-    /// rewrites one segment in v4 and publishes a v4 manifest still naming the
-    /// old generation for every other segment, which now hold `KINSEG05` files.
-    /// The following open decodes that magic as a bincode map length, fails,
-    /// archives the manifest as corrupt, and the index is gone with the
-    /// monolithic fallback already unlinked.
-    ///
-    /// The guards above could not see it, because they all build their heap
-    /// index with `TextIndex::new()`, whose `commit` persists nothing.
-    #[test]
-    fn a_mapped_write_over_a_bincode_baseline_survives_the_next_commit() {
-        let docs = corpus();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let storage = dir.path().join("index.bin");
-
-        let index: TextIndex<Key> = TextIndex::open(Some(&storage)).expect("open");
-        index.seg.write().segment_count = 4;
-        for (id, doc) in docs.iter().take(20) {
-            index.upsert_searchable(*id, doc).expect("upsert");
-        }
-        // A v4 baseline on disk, with the delta bookkeeping the next commit
-        // would use.
-        index.commit().expect("first commit");
-        assert!(
-            index.seg.read().baseline_gens.is_some(),
-            "the control: the bincode commit must leave a delta baseline, or the sequence this \
-             guards cannot arise"
-        );
-
-        // The mapped image over it.
-        index.persist_mapped(&storage).expect("persist_mapped");
-
-        // One more document, committed the ordinary way.
-        let extra = Doc {
-            name: "afterMapped".to_string(),
-            signature: "fn afterMapped(input: &str) -> Result<(), Error>".to_string(),
-            body: "afterMapped shared shared shared handler for afterMapped in module extra"
-                .to_string(),
-            kind: "Function".to_string(),
-        };
-        let extra_id = Key(9_999);
-        index.upsert_searchable(extra_id, &extra).expect("upsert");
-        index.commit().expect("second commit");
-
-        // And it must still open, hold everything, and answer.
-        let reopened: TextIndex<Key> = TextIndex::open(Some(&storage)).expect("reopen");
-        assert_eq!(
-            reopened.live_document_count(),
-            21,
-            "the reopened index lost documents, so a commit published a manifest naming files of \
-             the other format"
-        );
-        assert!(reopened.contains(&extra_id), "the last document is missing");
-        for (id, _) in docs.iter().take(20) {
-            assert!(reopened.contains(id), "{id:?} is missing after the reopen");
-        }
-        let hits = reopened
-            .fuzzy_search("shared", 100)
-            .expect("reopened search");
-        assert_eq!(
-            hits.len(),
-            21,
-            "`shared` is in every body, so it must return all 21 documents"
-        );
-        let want = index.fuzzy_search("shared", 100).expect("live search");
-        assert_identical("across a mapped write and a commit", &hits, &want);
-    }
+    // `a_mapped_write_over_a_bincode_baseline_survives_the_next_commit` is
+    // retired here, and its own control is why.
+    //
+    // It guarded a sequence that needed a v4 WRITER: a v4 commit leaves a
+    // baseline, a mapped write lands v5 bytes over it, and the next ordinary
+    // commit publishes a v4 manifest still naming generations that now hold
+    // KINSEG05 files. `21d26b6` deleted that writer, so the first thing the test
+    // does is assert `baseline_gens.is_some()` after a commit, and that
+    // assertion now correctly refuses: the commit wrote v5 and left no bincode
+    // baseline. A control that says the sequence cannot arise is the test
+    // reporting its own retirement.
+    //
+    // Its class did not go with it. The cross-format hazard it existed for, one
+    // `segment_path` namespace shared by v3, v4 and v5, is arm four of
+    // `no_writer_changes_the_bytes_behind_a_live_name`, which puts a real v4
+    // manifest under a v5 write. The "a mapped store must not be written by
+    // anything else" half is `toggling_off_a_mapped_index_does_not_revert_it`.
 
     /// A tombstone bit the manifest's own count does not admit must be refused.
     ///
