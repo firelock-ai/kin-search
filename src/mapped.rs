@@ -100,6 +100,18 @@ const MAGIC: [u8; 8] = *b"KINSEG05";
 /// the ones before it.
 const HEADER_LEN: usize = 96;
 
+/// The writer's point has to lie inside the reader's range, in both directions.
+///
+/// A compile-time assertion rather than a test, because the failure it prevents
+/// is a build that writes an index it cannot read back. It survives the cutover
+/// that moves the default commit onto the mapped layout, where the writer's
+/// point becomes equal to the reader's ceiling rather than below it.
+const _: () = assert!(
+    crate::MIN_SEGMENTED_FORMAT_VERSION <= crate::SEGMENTED_FORMAT_VERSION
+        && crate::SEGMENTED_FORMAT_VERSION <= MAPPED_SEGMENT_VERSION,
+    "the segmented writer's version must lie inside the range the loader reads"
+);
+
 // ── Varints ──────────────────────────────────────────────────────────────────
 
 /// Append `value` as an unsigned LEB128 varint.
@@ -1539,10 +1551,22 @@ mod tests {
         "日本語トークン",
     ];
 
+    /// Documents that tokenize IDENTICALLY, so a query on their shared token
+    /// scores them exactly equally.
+    ///
+    /// Without a forced tie the tie-break is unreachable and a mutant that
+    /// changed it would leave every guard here green. With one, the tie-break
+    /// decides both their order and which of them survives `truncate(limit)`.
+    const TWINS: usize = 6;
+
     /// Every query the identity guard runs. Exact hits, both substring
     /// directions, a query with no match at all, a query of only short tokens
-    /// (which must skip the substring branch entirely), and a multibyte query.
+    /// (which must skip the substring branch entirely), a multibyte query, the
+    /// universal token every document holds, and the forced tie.
     const QUERIES: &[&str] = &[
+        "shared",
+        "handler",
+        "twin",
         "parse",
         "parseTable",
         "widget",
@@ -1564,7 +1588,7 @@ mod tests {
     ];
 
     fn corpus() -> Vec<(Key, Doc)> {
-        NAMES
+        let mut docs: Vec<(Key, Doc)> = NAMES
             .iter()
             .enumerate()
             .map(|(index, name)| {
@@ -1573,6 +1597,10 @@ mod tests {
                 // several fields. That is what makes the run-length encoding
                 // carry runs longer than one and what makes a posting's weight
                 // sequence hold more than one distinct value.
+                //
+                // `shared` and `handler` land in EVERY body on purpose: a query
+                // for either has to return the whole corpus, which is a floor
+                // the fixture proves rather than one picked to pass.
                 let body = format!(
                     "{name} {name} shared shared shared handler for {name} in module {index}"
                 );
@@ -1586,7 +1614,34 @@ mod tests {
                     },
                 )
             })
-            .collect()
+            .collect();
+        for twin in 0..TWINS {
+            docs.push((
+                Key(NAMES.len() as u64 + twin as u64 + 1),
+                Doc {
+                    name: "twin".to_string(),
+                    signature: "fn twin(input: &str) -> Result<(), Error>".to_string(),
+                    body: "twin twin shared shared shared handler for twin in module twin"
+                        .to_string(),
+                    kind: "Function".to_string(),
+                },
+            ));
+        }
+        docs
+    }
+
+    /// The floor the fixture proves rather than one chosen to pass.
+    ///
+    /// Every document's body holds `shared`, so a query for it must return the
+    /// whole live corpus. An assertion about a count nobody can pick is what
+    /// keeps the identity comparisons from being a comparison of two indexes
+    /// that both answered nothing.
+    fn assert_reaches_every_document(label: &str, results: &[(Key, f32)], live: usize) {
+        assert_eq!(
+            results.len(),
+            live,
+            "{label}: `shared` is in every document's body, so it must return all {live} of them"
+        );
     }
 
     fn heap_index(docs: &[(Key, Doc)]) -> TextIndex<Key> {
@@ -1650,7 +1705,9 @@ mod tests {
 
             let mut answered = 0usize;
             for query in QUERIES {
-                for limit in [1usize, 5, 100] {
+                // 3 lands the truncate cutoff inside the six-way tie, where
+                // which documents survive is decided by the tie-break alone.
+                for limit in [1usize, 3, 5, 100] {
                     let want = heap.fuzzy_search(query, limit).expect("heap search");
                     let got = mapped.fuzzy_search(query, limit).expect("mapped search");
                     assert_identical(
@@ -1664,8 +1721,20 @@ mod tests {
             // Without this the assertions above would pass on two indexes that
             // both return nothing, which is the shape of a comparison about
             // nothing.
+            assert_reaches_every_document(
+                &format!("segments={segment_count}, mapped"),
+                &mapped
+                    .fuzzy_search("shared", docs.len() * 2)
+                    .expect("mapped"),
+                docs.len(),
+            );
+            assert_reaches_every_document(
+                &format!("segments={segment_count}, heap"),
+                &heap.fuzzy_search("shared", docs.len() * 2).expect("heap"),
+                docs.len(),
+            );
             assert!(
-                answered > 100,
+                answered > 3 * docs.len(),
                 "segments={segment_count}: the queries produced only {answered} results, so the \
                  comparison above proves little"
             );
@@ -1697,7 +1766,9 @@ mod tests {
     #[test]
     fn a_tombstone_delete_ranks_as_if_the_document_was_never_admitted() {
         let docs = corpus();
-        let removed: Vec<Key> = vec![Key(1), Key(4), Key(13), Key(14)];
+        // One of them is a twin, so the deletes change the tie set as well as
+        // the corpus statistics.
+        let removed: Vec<Key> = vec![Key(1), Key(4), Key(13), Key(14), Key(35)];
 
         let full = heap_index(&docs);
         full.seg.write().segment_count = 4;
@@ -1741,8 +1812,15 @@ mod tests {
                 );
             }
         }
+        assert_reaches_every_document(
+            "after delete, mapped",
+            &mapped
+                .fuzzy_search("shared", docs.len() * 2)
+                .expect("mapped"),
+            docs.len() - removed.len(),
+        );
         assert!(
-            answered > 100,
+            answered > docs.len(),
             "the queries produced only {answered} results after the deletes"
         );
         for term in ["parse", "user", "shared", "render"] {
@@ -1783,8 +1861,15 @@ mod tests {
             assert_identical(&format!("rehydrated, query={query:?}"), &got, &want);
             answered += want.len();
         }
+        assert_reaches_every_document(
+            "rehydrated",
+            &reopened
+                .fuzzy_search("shared", docs.len() * 2)
+                .expect("rehydrated"),
+            docs.len(),
+        );
         assert!(
-            answered > 100,
+            answered > docs.len(),
             "only {answered} results, so this proves little"
         );
 
@@ -1826,11 +1911,6 @@ mod tests {
             crate::MAX_SEGMENTED_FORMAT_VERSION,
             "the mapped layout must be the newest version the loader reads"
         );
-        assert!(
-            crate::SEGMENTED_FORMAT_VERSION < MAPPED_SEGMENT_VERSION,
-            "the default commit must still write below the mapped version"
-        );
-
         let docs = corpus();
         let heap = heap_index(&docs);
         heap.seg.write().segment_count = 4;
@@ -1879,6 +1959,57 @@ mod tests {
             format!("{error}").contains("not the mapped layout"),
             "the refusal must name the reason, got: {error}"
         );
+    }
+
+    /// A tie is broken by the id, and the tie is real.
+    ///
+    /// The second half is why this test exists. A tie-break is only reachable
+    /// when scores actually tie, so a guard that assumes a tie without asserting
+    /// one would stay green under a mutant that changed the tie-break. This
+    /// asserts the six twins score EXACTLY equally, then asserts how that tie is
+    /// broken, then asserts the `truncate(limit)` cutoff follows the same order,
+    /// which is where a tie-break change becomes a different answer rather than
+    /// a different ordering of the same one.
+    #[test]
+    fn a_forced_tie_is_broken_by_the_id_and_the_tie_is_real() {
+        let docs = corpus();
+        let heap = heap_index(&docs);
+        heap.seg.write().segment_count = 4;
+        let dir = tempfile::tempdir().expect("tempdir");
+        heap.persist_mapped(dir.path()).expect("persist_mapped");
+        let mapped: MappedIndex<Key> = MappedIndex::open(dir.path()).expect("open mapped");
+
+        let all = mapped.fuzzy_search("twin", docs.len()).expect("search");
+        assert_eq!(
+            all.len(),
+            TWINS,
+            "the twin documents are the only holders of `twin`, so the tie is exactly {TWINS} wide"
+        );
+        let first = all[0].1.to_bits();
+        assert!(
+            all.iter().all(|(_, score)| score.to_bits() == first),
+            "the twins must score EXACTLY equally, or the tie-break below is unreachable: {all:?}"
+        );
+
+        let order: Vec<String> = all.iter().map(|(id, _)| format!("{id:?}")).collect();
+        let mut ascending = order.clone();
+        ascending.sort();
+        assert_eq!(
+            order, ascending,
+            "a tie must be broken by the id's Debug representation, ascending"
+        );
+
+        for limit in 1..=TWINS {
+            let got = mapped.fuzzy_search("twin", limit).expect("mapped search");
+            let want = heap.fuzzy_search("twin", limit).expect("heap search");
+            assert_identical(&format!("tie at limit {limit}"), &got, &want);
+            assert_eq!(got.len(), limit, "limit {limit} must truncate to {limit}");
+            assert_eq!(
+                got.iter().map(|(id, _)| *id).collect::<Vec<Key>>(),
+                all[..limit].iter().map(|(id, _)| *id).collect::<Vec<Key>>(),
+                "which twins survive the truncate must follow the tie-break order"
+            );
+        }
     }
 
     /// The substring automaton must find exactly what a full scan of the term
