@@ -270,6 +270,15 @@ struct StagedState<Id: DocId> {
     docs: HashMap<Id, IndexedDoc>,
     doc_count: usize,
     total_doc_length: usize,
+    /// Ids removed since the last commit.
+    ///
+    /// Only the mapped path reads it, and only the mapped path could: the heap
+    /// path snapshots the live corpus into `docs` and expresses a removal by
+    /// ABSENCE from that snapshot. On a mapped store the snapshot starts empty,
+    /// because the heap maps are empty, so absence says nothing and a removal
+    /// has to be recorded rather than implied.
+    #[serde(default)]
+    removed: HashSet<Id>,
 }
 
 /// The monolithic on-disk layout, whose documents keep owned token strings.
@@ -1243,6 +1252,7 @@ impl<Id: DocId> TextIndex<Id> {
             docs: self.docs.read().clone(),
             doc_count: *self.doc_count.read(),
             total_doc_length: *self.total_doc_length.read(),
+            removed: HashSet::new(),
         })
     }
 
@@ -1410,6 +1420,8 @@ impl<Id: DocId> TextIndex<Id> {
                 doc_length,
             },
         );
+        // An upsert supersedes a removal staged earlier in the same batch.
+        state.removed.remove(&id);
         self.mark_doc_upserted(&id);
         drop(staged_guard);
         Ok(())
@@ -1479,6 +1491,8 @@ impl<Id: DocId> TextIndex<Id> {
                     doc_length,
                 },
             );
+            // An upsert supersedes a removal staged earlier in the same batch.
+            state.removed.remove(&id);
             self.mark_doc_upserted(&id);
         }
 
@@ -1511,6 +1525,9 @@ impl<Id: DocId> TextIndex<Id> {
             state.doc_count = state.doc_count.saturating_sub(1);
             state.total_doc_length = state.total_doc_length.saturating_sub(old_doc.doc_length);
         }
+        // Recorded as well as removed, because on a mapped store the snapshot
+        // above is empty and absence from it says nothing.
+        state.removed.insert(*id);
         self.mark_doc_removed(id);
         drop(staged_guard);
         Ok(())
@@ -1536,6 +1553,7 @@ impl<Id: DocId> TextIndex<Id> {
                 state.doc_count = state.doc_count.saturating_sub(1);
                 state.total_doc_length = state.total_doc_length.saturating_sub(old_doc.doc_length);
             }
+            state.removed.insert(*id);
         }
         for id in ids {
             self.mark_doc_removed(id);
@@ -1705,6 +1723,10 @@ impl<Id: DocId> TextIndex<Id> {
         let _span = tracing::info_span!("kin_search.commit", staged = self.staged.read().is_some())
             .entered();
         let mut staged_guard = self.staged.write();
+        if self.mapped.read().is_some() {
+            let state = staged_guard.take();
+            return self.commit_mapped(state);
+        }
         if let Some(state) = staged_guard.take() {
             {
                 let mut live = self.index.write();
@@ -1716,6 +1738,103 @@ impl<Id: DocId> TextIndex<Id> {
             *self.total_doc_length.write() = state.total_doc_length;
         }
         self.persist_to_disk()?;
+        Ok(())
+    }
+
+    /// Commit onto a mapped image: rewrite each segment from what survives in it
+    /// plus what the delta adds, then map the result.
+    ///
+    /// The staged state on a mapped store is a DELTA and not a snapshot, because
+    /// `ensure_staged` clones the heap maps and those are empty here. So
+    /// `state.docs` is exactly what was upserted, `state.removed` is exactly what
+    /// was removed, and everything else comes out of the mapping.
+    ///
+    /// Every segment is visited, but only one is resident at a time: the fold
+    /// reads a segment, the encoder consumes it, and both are dropped before the
+    /// next. A segment with no change is rewritten identically rather than
+    /// skipped, which costs write bandwidth and buys the guarantee that the new
+    /// manifest names only files this commit wrote. Skipping is the next change
+    /// and it needs the dirty set to be trustworthy first.
+    fn commit_mapped(&self, state: Option<StagedState<Id>>) -> Result<(), SearchError> {
+        let Some(path) = self.path.as_ref() else {
+            // Read-only handle: a mapped index it cannot write to. Dropping the
+            // delta is what `persist_to_disk` already does for this case.
+            return Ok(());
+        };
+        let (upserts, removed) = match state {
+            Some(state) => (state.docs, state.removed),
+            None => (HashMap::new(), HashSet::new()),
+        };
+
+        let mapped_guard = self.mapped.read();
+        let mapped = mapped_guard
+            .as_ref()
+            .expect("checked by the caller under the staged write guard");
+        let segment_count = mapped.segment_count().max(1);
+        let graph_root_hash = *self.graph_root_hash.read();
+
+        // A document's occurrences, resolved out of the vocabulary the staged
+        // ids name. The order is the order it produced them, which is the order
+        // its postings have to come back in.
+        let vocab = self.vocab.read();
+        let mut staged_tokens: HashMap<Id, Vec<(String, f32)>> =
+            HashMap::with_capacity(upserts.len());
+        for (id, doc) in &upserts {
+            let mut tokens = Vec::with_capacity(doc.tokens_by_field.len());
+            for (token_id, weight) in &doc.tokens_by_field {
+                let Some(token) = vocab.token(*token_id) else {
+                    return Err(SearchError::IndexError(format!(
+                        "a staged document names vocabulary id {token_id}, which this index never \
+                         interned"
+                    )));
+                };
+                tokens.push((token.as_ref().to_owned(), *weight));
+            }
+            staged_tokens.insert(*id, tokens);
+        }
+        drop(vocab);
+
+        let (doc_count, total_doc_length) =
+            mapped::write_mapped_streaming(path, segment_count, graph_root_hash, |segment| {
+                let mut build = mapped::SegmentBuild::new();
+                // What survives in the mapping: not removed, and not superseded
+                // by an upsert of the same id.
+                mapped.fold_segment_into(
+                    segment,
+                    |id| !removed.contains(id) && !staged_tokens.contains_key(id),
+                    &mut build,
+                )?;
+                for (id, tokens) in &staged_tokens {
+                    if segment_of(id, segment_count) != segment {
+                        continue;
+                    }
+                    let doc_length = upserts
+                        .get(id)
+                        .map(|doc| doc.doc_length)
+                        .expect("a staged token list names a staged document");
+                    build.push_document(*id, tokens, doc_length)?;
+                }
+                Ok(build)
+            })?;
+
+        drop(mapped_guard);
+        let reopened = MappedIndex::open(path)?;
+        if reopened.live_document_count() != doc_count
+            || reopened.total_doc_length() != total_doc_length
+        {
+            return Err(SearchError::IndexError(format!(
+                "the image just written holds {} documents of {} tokens and the write reported {} \
+                 of {}",
+                reopened.live_document_count(),
+                reopened.total_doc_length(),
+                doc_count,
+                total_doc_length
+            )));
+        }
+        *self.mapped.write() = Some(reopened);
+        *self.doc_count.write() = doc_count;
+        *self.total_doc_length.write() = total_doc_length;
+        self.index_epoch.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }

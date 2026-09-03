@@ -419,6 +419,27 @@ impl<Id: DocId + Serialize> SegmentBuild<Id> {
         self.total_doc_length
     }
 
+    /// Admit one document and every occurrence it contributes.
+    ///
+    /// `tokens` is the document's occurrences in the order it produced them,
+    /// which is the order a posting's weights have to come back in, because the
+    /// scorer sums them one at a time and float addition is not associative.
+    pub(crate) fn push_document(
+        &mut self,
+        id: Id,
+        tokens: &[(String, f32)],
+        doc_length: usize,
+    ) -> Result<(), SearchError> {
+        for (token, weight) in tokens {
+            let entry = self.terms.entry(token.clone()).or_default();
+            match entry.last_mut() {
+                Some((last, weights)) if *last == id => weights.push(*weight),
+                _ => entry.push((id, vec![*weight])),
+            }
+        }
+        self.push_document_meta(id, doc_length)
+    }
+
     /// Admit one document whose postings are already grouped by token.
     ///
     /// This is the shape a mapped segment yields when it is read back, so an
@@ -1892,6 +1913,80 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
             .into_iter()
             .map(|(_, id, score)| (id, score))
             .collect())
+    }
+}
+
+// ── Rewriting one segment of a mapped image ──────────────────────────────────
+
+impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
+    /// Fold segment `k`'s surviving documents into `build`.
+    ///
+    /// `keep` decides survival, so a commit passes it the ids it is removing and
+    /// the ids it is replacing, and the postings for those never enter the new
+    /// image. Tombstoned ordinals are skipped whatever `keep` says, because they
+    /// are already gone.
+    ///
+    /// This is the piece that makes an incremental commit cost one segment
+    /// rather than the corpus: the mapped image is read a segment at a time,
+    /// each one folded, encoded and dropped.
+    pub(crate) fn fold_segment_into<F>(
+        &self,
+        segment: usize,
+        keep: F,
+        build: &mut SegmentBuild<Id>,
+    ) -> Result<(), SearchError>
+    where
+        F: Fn(&Id) -> bool,
+    {
+        let Some(mapped) = self.segments.get(segment).and_then(|s| s.as_ref()) else {
+            return Ok(());
+        };
+        let tombstones = &self.tombstones[segment];
+        let fail = |reason: String| SearchError::IndexError(format!("segment {segment}: {reason}"));
+
+        // The surviving documents first, so every posting below names one the
+        // build already holds.
+        let mut survivors: HashMap<u32, Id> = HashMap::new();
+        for ordinal in 0..mapped.doc_count {
+            let ordinal = u32::try_from(ordinal)
+                .map_err(|_| fail("a segment holds over 4 billion documents".to_string()))?;
+            if tombstones.is_set(ordinal) {
+                continue;
+            }
+            let encoded = mapped
+                .encoded_id(ordinal)
+                .ok_or_else(|| fail(format!("no document id at ordinal {ordinal}")))?;
+            let id: Id = bincode::deserialize(encoded)
+                .map_err(|err| fail(format!("undecodable document id: {err}")))?;
+            if !keep(&id) {
+                continue;
+            }
+            let doc_length = mapped
+                .doc_length(ordinal)
+                .ok_or_else(|| fail(format!("no document length at ordinal {ordinal}")))?;
+            survivors.insert(ordinal, id);
+            build.push_document_meta(id, doc_length)?;
+        }
+        if survivors.is_empty() {
+            return Ok(());
+        }
+
+        let (table, _) = mapped.weight_table().map_err(fail)?;
+        let mut stream = mapped.terms.stream();
+        let mut weights: Vec<f32> = Vec::new();
+        while let Some((key, offset)) = stream.next() {
+            let token = std::str::from_utf8(key)
+                .map_err(|err| fail(format!("a term is not UTF-8: {err}")))?
+                .to_owned();
+            let (mut cursor, _) = mapped.cursor_at(offset).map_err(fail)?;
+            while let Some((ordinal, _)) = cursor.next(&table, &mut weights).map_err(fail)? {
+                let Some(id) = survivors.get(&ordinal) else {
+                    continue;
+                };
+                build.push_postings(*id, &token, &weights);
+            }
+        }
+        Ok(())
     }
 }
 
