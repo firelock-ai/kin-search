@@ -2681,11 +2681,28 @@ where
     /// holding `index.bin`.
     pub fn persist_mapped(&self, path: &Path) -> Result<(), SearchError> {
         let storage_path = storage_file_path_for(path);
-        // `staged` first, then the live guards: the canonical order, so a
-        // concurrent writer or committer cannot invert them against this call.
+        // All FOUR live guards are held at once, and that is the difference
+        // between a consistent image and a rejected one.
+        //
+        // `staged` is not enough on its own. `rebuild_all` and
+        // `rebuild_all_owned` publish `index`, then `docs`, then the two
+        // counters under four INDEPENDENT write guards and clear `staged` only
+        // afterwards, so a snapshot taken between the first two would bucket a
+        // new inverted index against the old document set. `bucket`'s
+        // membership filter then silently drops every posting for a new id, and
+        // the image is either refused by its own load-time cross-check or served
+        // with a wrong `avgdl`. Holding all four blocks that publication
+        // outright.
+        //
+        // Order is `staged`, then the live guards in the order every other
+        // reader takes them (`index`, `docs`, `doc_count`, `total_doc_length`),
+        // then `seg`. That is the canonical order, so no writer or committer can
+        // invert it against this call.
         let _staged = self.staged.read();
         let index = self.index.read();
         let docs = self.docs.read();
+        let doc_count = self.doc_count.read();
+        let total_doc_length = self.total_doc_length.read();
         let doc_lengths: HashMap<Id, usize> =
             docs.iter().map(|(id, doc)| (*id, doc.doc_length)).collect();
         let segment_count = self.seg.read().segment_count.max(1);
@@ -2694,10 +2711,28 @@ where
             &index,
             &doc_lengths,
             segment_count,
-            *self.doc_count.read(),
-            *self.total_doc_length.read(),
+            *doc_count,
+            *total_doc_length,
             *self.graph_root_hash.read(),
-        )
+        )?;
+
+        // The mapped image is now the canonical one at this path, so the
+        // bincode writer's delta baseline has to go.
+        //
+        // Without this the next ordinary `commit` is a DELTA: it rewrites only
+        // the segments whose documents changed, in v4, and publishes a v4
+        // manifest that still names the old generation for every other segment.
+        // Those segments now hold `KINSEG05` files, so the following `open`
+        // decodes the magic as a bincode map length, fails, archives the
+        // manifest as corrupt, and the whole persisted index is gone, with the
+        // monolithic fallback already unlinked. Clearing the baseline forces
+        // that commit to be a full establishing rewrite, whose manifest names
+        // only files it just wrote.
+        let mut seg = self.seg.write();
+        seg.baseline_gens = None;
+        seg.segment_docs = None;
+        seg.dirty = SegmentDirty::All;
+        Ok(())
     }
 
     /// Remove a stale segmented manifest (and orphaned segment files) when the

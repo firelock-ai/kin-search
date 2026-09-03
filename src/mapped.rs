@@ -54,11 +54,14 @@
 //!
 //! - `token.contains(qt)`, the ordinary direction, is one traversal of the
 //!   mapped FST under a `.*qt.*` automaton. It allocates nothing.
-//! - `qt.contains(token)`, the reverse direction, is at most `qt.len()` EXACT
-//!   lookups: the only indexed tokens that can match are the substrings of `qt`
-//!   at least `ceil(3 * qt.len() / 4)` bytes long, and at least
-//!   [`MIN_SUBSTRING_LEN`], so they are enumerated and probed rather than
-//!   searched for. A twenty-byte query token is twenty point lookups.
+//! - `qt.contains(token)`, the reverse direction, is a bounded enumeration of
+//!   the only substrings of `qt` that can match, each one exact lookup. The
+//!   floor is `ceil(3 * qt.len() / 4)` bytes and at least [`MIN_SUBSTRING_LEN`],
+//!   so the count is quadratic in the quarter above the floor rather than in the
+//!   query: 21 candidates for a 20-byte token, 66 for 40 bytes, 1,326 for 200.
+//!   Long query tokens are ordinary input, because `tokenize` emits whole path
+//!   and identifier segments, so the loop is bounded by the floor rather than
+//!   scanning every start and end pair.
 //!
 //! Against that, the trigram index costs a full vocabulary walk allocating a
 //! `Box<str>` per token, on the first fuzzy query after every commit, load or
@@ -142,6 +145,13 @@ fn get_uvarint(data: &[u8], pos: &mut usize) -> Option<u64> {
         if shift > 63 {
             return None;
         }
+        // The tenth byte can carry only one payload bit. Anything above that is
+        // a non-canonical encoding whose upper bits this shift would drop, and
+        // two different byte strings decoding to one value is a corruption
+        // signal thrown away.
+        if shift == 63 && *data.get(*pos)? > 1 {
+            return None;
+        }
     }
 }
 
@@ -170,6 +180,28 @@ fn read_u64(data: &[u8], at: usize) -> Option<u64> {
 pub(crate) struct Tombstones {
     words: Vec<u64>,
     set_count: usize,
+}
+
+impl Tombstones {
+    /// Recompute the cached count from the bits, discarding whatever the file
+    /// claimed.
+    ///
+    /// The two are read by different decisions and a disagreement between them
+    /// is the exact failure the delete guard exists to catch, reached through
+    /// the one path that guard cannot see. `any()` reads the count and gates
+    /// both the load-time reconciliation and the fast path that trusts a
+    /// stored `df`; `is_set` reads the bits and gates the posting walk. A
+    /// manifest with a bit set and a count of zero therefore hides a document
+    /// from results while still counting it in `N`, in `avgdl` and in every
+    /// term's `df`. Deriving the count removes the class rather than checking
+    /// for it.
+    fn rebuild_count(&mut self) {
+        self.set_count = self
+            .words
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum();
+    }
 }
 
 impl Tombstones {
@@ -239,8 +271,13 @@ impl AsRef<[u8]> for MmapRange {
 /// The state is the number of needle bytes currently matched, advanced through a
 /// KMP failure table so a transition is O(1) amortized rather than a rescan. The
 /// accepting state is sticky: once a key contains the needle, every extension of
-/// it does too, which is what `will_always_match` tells the traversal so it can
-/// stop re-examining that subtree.
+/// it does too.
+///
+/// `will_always_match` reports that stickiness but buys nothing here, because
+/// fst 0.4.7's raw stream consults only `start`, `is_match`, `can_match`,
+/// `accept` and `accept_eof` (`fst/src/raw/mod.rs`, `Stream::next_with`). It is
+/// implemented anyway because it is part of the trait's contract and a later
+/// version may use it; no subtree is skipped today.
 ///
 /// It deliberately does NOT prune: from the start state every byte is a legal
 /// transition, so this is a full traversal of the mapped FST. That is the honest
@@ -654,13 +691,24 @@ fn read_manifest_gens(storage_path: &Path) -> Vec<Option<u64>> {
         return Vec::new();
     }
     let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    if version != MAPPED_SEGMENT_VERSION {
-        return Vec::new();
+    if version == MAPPED_SEGMENT_VERSION {
+        return match bincode::deserialize::<MappedManifest>(&bytes) {
+            Ok(manifest) if manifest.version == MAPPED_SEGMENT_VERSION => manifest.segment_gens,
+            _ => Vec::new(),
+        };
     }
-    match bincode::deserialize::<MappedManifest>(&bytes) {
-        Ok(manifest) if manifest.version == MAPPED_SEGMENT_VERSION => manifest.segment_gens,
-        _ => Vec::new(),
+    // A v3 or v4 manifest's generations count too, because `segment_path` is one
+    // namespace shared by both formats. Ignoring them let a mapped write rename
+    // over the very files a live bincode manifest named, which destroys the
+    // previous image before the new manifest is published: a crash in that
+    // window leaves the old manifest pointing at a mixture.
+    if (crate::MIN_SEGMENTED_FORMAT_VERSION..MAPPED_SEGMENT_VERSION).contains(&version) {
+        return match bincode::deserialize::<crate::SegmentManifest>(&bytes) {
+            Ok(manifest) if manifest.version == version => manifest.segment_gens,
+            _ => Vec::new(),
+        };
     }
+    Vec::new()
 }
 
 // ── The reader ───────────────────────────────────────────────────────────────
@@ -681,16 +729,23 @@ struct MappedSegment {
 }
 
 /// A term's postings, positioned for a forward walk.
+///
+/// It borrows the segment rather than just its postings bytes, so a posting's
+/// ordinal is checked against the document table as it is read and a run is
+/// bounded by that document's own token count. Both come from the same file, so
+/// a torn postings section is caught by the part of the file that disagrees with
+/// it rather than by an allocator.
 struct TermCursor<'a> {
-    data: &'a [u8],
+    segment: &'a MappedSegment,
     pos: usize,
     remaining: u64,
     previous: i64,
 }
 
 impl TermCursor<'_> {
-    /// The next live posting: the document ordinal, with its weights appended to
-    /// `weights` in the order the document contributed them.
+    /// The next posting: the document ordinal and its length, with the
+    /// document's weights appended to `weights` in the order it contributed
+    /// them.
     ///
     /// `weights` is cleared first and reused across calls, so a walk over a hot
     /// term allocates once rather than once per document.
@@ -698,12 +753,13 @@ impl TermCursor<'_> {
         &mut self,
         weight_table: &[f32],
         weights: &mut Vec<f32>,
-    ) -> Result<Option<u32>, String> {
+    ) -> Result<Option<(u32, usize)>, String> {
         if self.remaining == 0 {
             return Ok(None);
         }
         self.remaining -= 1;
-        let delta = get_uvarint(self.data, &mut self.pos).ok_or("truncated posting delta")?;
+        let data = self.segment.postings_section();
+        let delta = get_uvarint(data, &mut self.pos).ok_or("truncated posting delta")?;
         let ordinal_i64 = self
             .previous
             .checked_add(1)
@@ -712,30 +768,53 @@ impl TermCursor<'_> {
         let ordinal = u32::try_from(ordinal_i64).map_err(|_| "posting ordinal out of range")?;
         self.previous = ordinal_i64;
 
-        let run_count = get_uvarint(self.data, &mut self.pos).ok_or("truncated run count")?;
+        // The document's own token count is the bound on how many times it can
+        // hold one token, and it is the only bound that means anything. Without
+        // it a torn run length of `u64::MAX` pushes four bytes per iteration
+        // until the allocator gives up: a hang and an abort rather than a typed
+        // corruption error. It doubles as the check that every posting names an
+        // ordinal the document table actually holds, which otherwise fell
+        // through to scoring the document at `avgdl`.
+        let doc_length = self
+            .segment
+            .doc_length(ordinal)
+            .ok_or("a posting names an ordinal the document table does not hold")?;
+
+        let run_count = get_uvarint(data, &mut self.pos).ok_or("truncated run count")?;
         weights.clear();
         for _ in 0..run_count {
-            let code = get_uvarint(self.data, &mut self.pos).ok_or("truncated weight code")?;
-            let repeat = get_uvarint(self.data, &mut self.pos).ok_or("truncated run length")?;
+            let code = get_uvarint(data, &mut self.pos).ok_or("truncated weight code")?;
+            let repeat = get_uvarint(data, &mut self.pos).ok_or("truncated run length")?;
+            let repeat = usize::try_from(repeat).map_err(|_| "run length out of range")?;
             let weight = *weight_table
                 .get(usize::try_from(code).map_err(|_| "weight code out of range")?)
                 .ok_or("a posting names a weight the segment never interned")?;
+            if weights.len().saturating_add(repeat) > doc_length {
+                return Err(format!(
+                    "a posting claims more than {doc_length} occurrences of one token in a \
+                     document of {doc_length} tokens"
+                ));
+            }
             for _ in 0..repeat {
                 weights.push(weight);
             }
         }
-        Ok(Some(ordinal))
+        Ok(Some((ordinal, doc_length)))
     }
 }
 
 impl MappedSegment {
     fn open(path: &Path) -> Result<Self, String> {
         let file = std::fs::File::open(path).map_err(|err| format!("unreadable: {err}"))?;
-        // Safety: the caller maps a segment file the manifest names, and this
-        // crate only ever publishes a segment under a fresh generation and never
-        // rewrites one in place, so the bytes behind the mapping do not change
-        // while it is held. The best-effort unlink of a superseded generation is
-        // safe under POSIX because the inode outlives the mapping.
+        // Safety, stated as what actually holds rather than as what would be
+        // convenient. Every writer in this crate publishes a segment by renaming
+        // a freshly written temp file over the name, so the inode behind an
+        // existing mapping is never modified, whatever generation the name
+        // carries; and the best-effort unlink of a superseded generation is safe
+        // under POSIX because the inode outlives the mapping. What this does NOT
+        // survive is a foreign process truncating a segment file, which faults
+        // the pages past the new end; that is inherent to serving an index from
+        // a mapping and every mmap-backed index carries it.
         let map = unsafe { Mmap::map(&file) }.map_err(|err| format!("unmappable: {err}"))?;
         let data = &map[..];
         if data.len() < HEADER_LEN {
@@ -798,14 +877,92 @@ impl MappedSegment {
         })
         .map_err(|err| format!("undecodable term dictionary: {err}"))?;
 
-        Ok(Self {
+        // `fst::Map::new` is not validation. It checks the length, the version
+        // word and one root-address plausibility test, and never the CRC32 it
+        // wrote; fst's own comment on that cheap check says a false positive
+        // means "the program will probably panic" or "the FST will operate but
+        // be subtly wrong". A traversal over a corrupt transition table can
+        // panic on an out-of-bounds node or fail to terminate, so the checksum
+        // is computed here instead.
+        //
+        // It costs one sequential pass over the term dictionary per segment at
+        // open, which is the section that scales with vocabulary rather than
+        // with occurrences. If that ever becomes material on a large corpus the
+        // answer is to move it off the open path, not to drop it: an unverified
+        // FST is a query that hangs or lies.
+        terms
+            .as_fst()
+            .verify()
+            .map_err(|err| format!("the term dictionary fails its own checksum: {err}"))?;
+
+        let segment = Self {
             map,
             terms,
             post: (post_off, post_len),
             docs: (docs_off, docs_len),
             doc_count,
             total_doc_length,
-        })
+        };
+        segment.validate_document_table()?;
+        Ok(segment)
+    }
+
+    /// Check the document table once, so every read against it afterwards is
+    /// sound rather than trusting.
+    ///
+    /// Two properties, and both are load-bearing. The offsets must be
+    /// CONTIGUOUS and end at the blob's length, because `encoded_id` slices
+    /// `start..end` from a neighbouring pair and `bincode` ignores trailing
+    /// bytes: shift one offset back and an over-long slice decodes fine, so a
+    /// document's score comes back under a DIFFERENT live document's id and the
+    /// same id appears twice in one result list. And the ids must be STRICTLY
+    /// INCREASING in their encoded bytes, because `ordinal_of` binary-searches
+    /// them; on an unsorted blob it answers `None`, so `contains` says a present
+    /// document is absent and `remove` silently removes nothing and reports
+    /// nothing.
+    fn validate_document_table(&self) -> Result<(), String> {
+        let data = self.docs_section();
+        let stored = read_u64(data, 0).ok_or("truncated document count")? as usize;
+        if stored != self.doc_count {
+            return Err(format!(
+                "the header declares {} documents and the document table {stored}",
+                self.doc_count
+            ));
+        }
+        let mut previous_end = 0usize;
+        let mut previous_id: &[u8] = &[];
+        for ordinal in 0..self.doc_count {
+            let start = read_u32(data, 8 + 4 * ordinal).ok_or("truncated id offset")? as usize;
+            let end = read_u32(data, 8 + 4 * (ordinal + 1)).ok_or("truncated id offset")? as usize;
+            if start != previous_end {
+                return Err(format!(
+                    "document {ordinal} starts at {start}, leaving a gap or an overlap after {previous_end}"
+                ));
+            }
+            let ordinal_u32 = u32::try_from(ordinal).map_err(|_| "ordinal out of range")?;
+            let id = self
+                .encoded_id(ordinal_u32)
+                .ok_or("a document id runs past the table")?;
+            if id.len() != end - start {
+                return Err(format!("document {ordinal} has an inconsistent id length"));
+            }
+            if ordinal > 0 && id <= previous_id {
+                return Err(format!(
+                    "document {ordinal} does not sort after {}, so the table is not searchable",
+                    ordinal - 1
+                ));
+            }
+            previous_end = end;
+            previous_id = id;
+        }
+        let blob_at = 8 + 4 * (self.doc_count + 1) + 4 * self.doc_count;
+        let blob_len = data.len().saturating_sub(blob_at);
+        if previous_end != blob_len {
+            return Err(format!(
+                "the document ids end at {previous_end} and the blob is {blob_len} bytes"
+            ));
+        }
+        Ok(())
     }
 
     fn postings_section(&self) -> &[u8] {
@@ -826,6 +983,19 @@ impl MappedSegment {
         let mut pos = 0usize;
         let count = get_uvarint(data, &mut pos).ok_or("truncated weight table")?;
         let count = usize::try_from(count).map_err(|_| "weight table too large")?;
+        // Bounded against the section BEFORE the allocation, not after. The
+        // count is a varint out of a file a crash may have torn, and reserving
+        // from it first turns a corrupt segment into a capacity overflow or an
+        // allocator abort inside a query rather than a typed error: the varint
+        // `80 80 80 80 80 80 80 80 80 01` asks for 2^63 entries and the
+        // per-entry read that would have caught it never runs.
+        let available = data.len().saturating_sub(pos) / 4;
+        if count > available {
+            return Err(format!(
+                "a weight table of {count} entries does not fit the {available} that remain in \
+                 the postings section"
+            ));
+        }
         let mut table = Vec::with_capacity(count);
         for _ in 0..count {
             let bits = read_u32(data, pos).ok_or("truncated weight")?;
@@ -843,9 +1013,12 @@ impl MappedSegment {
         }
         let df = get_uvarint(data, &mut pos).ok_or("truncated document frequency")?;
         let occurrences = get_uvarint(data, &mut pos).ok_or("truncated occurrence count")?;
+        // `df` is not bounded here and does not need to be: every iteration of
+        // the walk consumes at least one byte of a bounded section, so an
+        // inflated count terminates in a truncation error rather than looping.
         Ok((
             TermCursor {
-                data,
+                segment: self,
                 pos,
                 remaining: df,
                 previous: -1,
@@ -1002,6 +1175,14 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
                 false,
             ));
         }
+
+        // Whatever the file claimed the tombstone counts were, they are the
+        // bits' own popcount from here on.
+        let mut manifest = manifest;
+        for tombstones in manifest.tombstones.iter_mut() {
+            tombstones.rebuild_count();
+        }
+        let manifest = manifest;
 
         let mut segments: Vec<Option<MappedSegment>> = Vec::with_capacity(manifest.segment_count);
         for (segment, gen) in manifest.segment_gens.iter().enumerate() {
@@ -1180,7 +1361,7 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
                 SearchError::IndexError(format!("segment {}: {reason}", slot.segment))
             })?;
             let mut weights: Vec<f32> = Vec::new();
-            while let Some(ordinal) = cursor.next(&table, &mut weights).map_err(|reason| {
+            while let Some((ordinal, _)) = cursor.next(&table, &mut weights).map_err(|reason| {
                 SearchError::IndexError(format!("segment {}: {reason}", slot.segment))
             })? {
                 if !self.tombstones[slot.segment].is_set(ordinal) {
@@ -1268,15 +1449,29 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
     ///
     /// Enumerated rather than searched. Only a substring of the query can match
     /// this direction, and [`reverse_substring_admits`] floors its length at
-    /// three quarters of the query's, so the candidates number at most
-    /// `query_token.len()` and each is one exact lookup in the term dictionary.
-    /// A trigram index is not needed to find them and a traversal is not needed
-    /// to filter them.
+    /// three quarters of the query's, so the loop starts at that floor rather
+    /// than at [`MIN_SUBSTRING_LEN`]. That matters because `tokenize` emits
+    /// whole path and identifier segments, so a long query token is ordinary
+    /// input: scanning every start and end pair is 19,900 iterations for a
+    /// 200-byte token against the 1,326 candidates that can actually clear the
+    /// floor.
     fn reverse_substring_candidates(&self, query_token: &str) -> BTreeSet<Vec<u8>> {
         let mut matched: BTreeSet<Vec<u8>> = BTreeSet::new();
         let bytes = query_token.as_bytes();
-        for start in 0..bytes.len() {
-            for end in (start + MIN_SUBSTRING_LEN)..=bytes.len() {
+        // The floor as integer arithmetic. `reverse_substring_admits` accepts a
+        // candidate when `len * DEN >= |qt| * NUM`, so the shortest acceptable
+        // length is `ceil(|qt| * NUM / DEN)`, which is `(|qt| * 3).div_ceil(4)`
+        // and NOT `|qt|.div_ceil(4) * 3`: the second is larger for two lengths
+        // in every four (a 5-byte query needs 4, not 6) and would silently drop
+        // candidates the predicate accepts. A table over both forms is what
+        // caught that, and the predicate is still called on every candidate, so
+        // this only skips lengths it could never accept.
+        let floor = crate::MIN_SUBSTRING_LEN.max((bytes.len() * 3).div_ceil(4));
+        if floor > bytes.len() {
+            return matched;
+        }
+        for start in 0..=(bytes.len() - floor) {
+            for end in (start + floor)..=bytes.len() {
                 let candidate = &bytes[start..end];
                 if candidate == bytes {
                     continue;
@@ -1360,7 +1555,16 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
     ///
     /// Bit-identical to [`TextIndex::fuzzy_search`](crate::TextIndex::fuzzy_search)
     /// on the same corpus, which is asserted by a guard rather than asserted
-    /// here. What makes it hold: the same BM25 constants, the same IDF over
+    /// here.
+    ///
+    /// **The identity holds only for an `Id` whose `Debug` is injective.** The
+    /// tie-break is `format!("{id:?}")`, on both sides, and a `Debug` that
+    /// renders two distinct ids the same leaves the order of a score tie to
+    /// whichever process-randomized `HashMap` iteration each side happened to
+    /// produce, so the two disagree with each other and each disagrees run to
+    /// run. That is inherited from the heap index rather than introduced here,
+    /// and kin-db's `RetrievalKey` derives `Debug`, which is injective; a caller
+    /// with a hand-written `Debug` is the case to watch. What makes it hold: the same BM25 constants, the same IDF over
     /// distinct live documents, the same per-occurrence saturation of the field
     /// weight, terms visited in the same order, a document's occurrences replayed
     /// in the order it contributed them, and the same tie-break on the id's
@@ -1405,17 +1609,21 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
                 let (mut cursor, _) = mapped.cursor_at(slot.offset).map_err(|reason| {
                     SearchError::IndexError(format!("segment {segment}: {reason}"))
                 })?;
-                while let Some(ordinal) = cursor.next(&table, &mut weights).map_err(|reason| {
-                    SearchError::IndexError(format!("segment {segment}: {reason}"))
-                })? {
+                while let Some((ordinal, doc_length)) =
+                    cursor.next(&table, &mut weights).map_err(|reason| {
+                        SearchError::IndexError(format!("segment {segment}: {reason}"))
+                    })?
+                {
                     if self.tombstones[segment].is_set(ordinal) {
                         continue;
                     }
                     let key = ((segment as u64) << 32) | u64::from(ordinal);
-                    let dl = mapped
-                        .doc_length(ordinal)
-                        .map(|length| length as f32)
-                        .unwrap_or(avgdl);
+                    // The cursor already resolved this against the document
+                    // table, so there is no ordinal here that it does not hold.
+                    // The heap index's `unwrap_or(avgdl)` fallback for a missing
+                    // document has no counterpart because the case is refused
+                    // rather than scored.
+                    let dl = doc_length as f32;
                     let length_norm = BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avgdl);
                     let accumulator = scores.entry(key).or_insert(0.0);
                     for weight in weights.iter() {
@@ -1586,7 +1794,7 @@ pub(crate) fn rehydrate<Id: DocId + Serialize + DeserializeOwned>(
                 .to_owned();
             let token_id = vocab.intern(&token);
             let (mut cursor, _) = mapped.cursor_at(offset).map_err(fail)?;
-            while let Some(ordinal) = cursor.next(&table, &mut weights).map_err(fail)? {
+            while let Some((ordinal, _)) = cursor.next(&table, &mut weights).map_err(fail)? {
                 let Some(id) = live.get(&ordinal) else {
                     continue;
                 };
@@ -2100,6 +2308,160 @@ mod tests {
         );
     }
 
+    /// A mapped write over a bincode baseline must not leave the next ordinary
+    /// commit able to publish a manifest that names files of the other format.
+    ///
+    /// The sequence that lost a corpus: a v4 commit establishes a baseline at
+    /// generation 0 and leaves `dirty` tracked-empty; a mapped write lands v5
+    /// bytes and a v5 manifest; the next ordinary commit is then a DELTA, so it
+    /// rewrites one segment in v4 and publishes a v4 manifest still naming the
+    /// old generation for every other segment, which now hold `KINSEG05` files.
+    /// The following open decodes that magic as a bincode map length, fails,
+    /// archives the manifest as corrupt, and the index is gone with the
+    /// monolithic fallback already unlinked.
+    ///
+    /// The guards above could not see it, because they all build their heap
+    /// index with `TextIndex::new()`, whose `commit` persists nothing.
+    #[test]
+    fn a_mapped_write_over_a_bincode_baseline_survives_the_next_commit() {
+        let docs = corpus();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = dir.path().join("index.bin");
+
+        let index: TextIndex<Key> = TextIndex::open(Some(&storage)).expect("open");
+        index.seg.write().segment_count = 4;
+        for (id, doc) in docs.iter().take(20) {
+            index.upsert_searchable(*id, doc).expect("upsert");
+        }
+        // A v4 baseline on disk, with the delta bookkeeping the next commit
+        // would use.
+        index.commit().expect("first commit");
+        assert!(
+            index.seg.read().baseline_gens.is_some(),
+            "the control: the bincode commit must leave a delta baseline, or the sequence this \
+             guards cannot arise"
+        );
+
+        // The mapped image over it.
+        index.persist_mapped(&storage).expect("persist_mapped");
+
+        // One more document, committed the ordinary way.
+        let extra = Doc {
+            name: "afterMapped".to_string(),
+            signature: "fn afterMapped(input: &str) -> Result<(), Error>".to_string(),
+            body: "afterMapped shared shared shared handler for afterMapped in module extra"
+                .to_string(),
+            kind: "Function".to_string(),
+        };
+        let extra_id = Key(9_999);
+        index.upsert_searchable(extra_id, &extra).expect("upsert");
+        index.commit().expect("second commit");
+
+        // And it must still open, hold everything, and answer.
+        let reopened: TextIndex<Key> = TextIndex::open(Some(&storage)).expect("reopen");
+        assert_eq!(
+            reopened.live_document_count(),
+            21,
+            "the reopened index lost documents, so a commit published a manifest naming files of \
+             the other format"
+        );
+        assert!(reopened.contains(&extra_id), "the last document is missing");
+        for (id, _) in docs.iter().take(20) {
+            assert!(reopened.contains(id), "{id:?} is missing after the reopen");
+        }
+        let hits = reopened
+            .fuzzy_search("shared", 100)
+            .expect("reopened search");
+        assert_eq!(
+            hits.len(),
+            21,
+            "`shared` is in every body, so it must return all 21 documents"
+        );
+        let want = index.fuzzy_search("shared", 100).expect("live search");
+        assert_identical("across a mapped write and a commit", &hits, &want);
+    }
+
+    /// A tombstone bit the manifest's own count does not admit must be refused.
+    ///
+    /// The count and the bits gate different decisions: the count gates the
+    /// load-time reconciliation and the fast path that trusts a stored `df`,
+    /// the bits gate the posting walk. A manifest with a bit set and a count of
+    /// zero therefore hid a document from results while still counting it in
+    /// `N`, in `avgdl` and in every term's `df` — precisely what the delete
+    /// guard says it catches, reached through the one path that guard cannot
+    /// see. The count is now derived from the bits, so the reconciliation runs
+    /// and refuses.
+    #[test]
+    fn a_tombstone_bit_the_manifests_count_denies_is_refused() {
+        let docs = corpus();
+        let heap = heap_index(&docs);
+        heap.seg.write().segment_count = 4;
+        let dir = tempfile::tempdir().expect("tempdir");
+        heap.persist_mapped(dir.path()).expect("persist_mapped");
+        let storage = crate::storage_file_path_for(dir.path());
+
+        // The control: intact, it opens.
+        assert!(MappedIndex::<Key>::open(dir.path()).is_ok());
+
+        let m_path = manifest_path(&storage);
+        let bytes = std::fs::read(&m_path).expect("read manifest");
+        let mut manifest: MappedManifest = bincode::deserialize(&bytes).expect("decode manifest");
+        let segment = manifest
+            .segment_gens
+            .iter()
+            .position(Option::is_some)
+            .expect("some segment has a file");
+        manifest.tombstones[segment].words[0] |= 1;
+        assert_eq!(
+            manifest.tombstones[segment].set_count, 0,
+            "the count must be left claiming nothing was removed, or this tests something else"
+        );
+        std::fs::write(&m_path, bincode::serialize(&manifest).expect("encode")).expect("write");
+
+        let error = MappedIndex::<Key>::open(dir.path())
+            .expect_err("a bit the count denies must be refused");
+        assert!(
+            format!("{error}").contains("tombstoned"),
+            "the refusal must name the reconciliation, got: {error}"
+        );
+    }
+
+    /// The reverse direction's length floor must be the predicate's own floor.
+    ///
+    /// The enumeration skips lengths `reverse_substring_admits` could never
+    /// accept, and getting that arithmetic wrong drops candidates silently:
+    /// `ceil(n*3/4)` and `ceil(n/4)*3` agree on half of all lengths and differ
+    /// on the rest, so a fixture would have to hold a token at exactly one of
+    /// the differing lengths for a set comparison to notice. Written after the
+    /// wrong form went in and a table caught it.
+    #[test]
+    fn the_reverse_floor_is_the_predicates_own_floor() {
+        let mut differing = 0usize;
+        for query_len in MIN_SUBSTRING_LEN..200usize {
+            let floor = MIN_SUBSTRING_LEN.max((query_len * 3).div_ceil(4));
+            let wrong = MIN_SUBSTRING_LEN.max(query_len.div_ceil(4) * 3);
+            if wrong != floor {
+                differing += 1;
+            }
+            let query = "a".repeat(query_len);
+            for candidate_len in MIN_SUBSTRING_LEN..=query_len {
+                let candidate = "a".repeat(candidate_len);
+                assert_eq!(
+                    reverse_substring_admits(&query, &candidate),
+                    candidate_len >= floor,
+                    "query {query_len} bytes, candidate {candidate_len}: the predicate and the \
+                     floor disagree"
+                );
+            }
+        }
+        // The control that the two forms are not the same expression, so the
+        // assertion above is about something.
+        assert!(
+            differing > 50,
+            "only {differing} lengths distinguish the two floor forms, so this proves little"
+        );
+    }
+
     /// A second write must not touch a file the live manifest names.
     ///
     /// The manifest is the only commit point, and that holds only while every
@@ -2392,7 +2754,7 @@ mod tests {
             let mut seen: HashMap<Key, Vec<f32>> = HashMap::new();
             let mut weights: Vec<f32> = Vec::new();
             let mut total = 0usize;
-            while let Some(ordinal) = cursor.next(&table, &mut weights).expect("posting") {
+            while let Some((ordinal, _)) = cursor.next(&table, &mut weights).expect("posting") {
                 let encoded = segment.encoded_id(ordinal).expect("id");
                 let id: Key = bincode::deserialize(encoded).expect("decode id");
                 total += weights.len();
