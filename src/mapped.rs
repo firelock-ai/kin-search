@@ -3198,6 +3198,175 @@ mod tests {
         assert_identical("emptied term", &got, &want);
     }
 
+    /// The PUBLIC api on a mapped store answers exactly as it does on a heap one.
+    ///
+    /// The identity guard above proves `MappedIndex` against the heap index.
+    /// This proves the DISPATCH: a store opened through `TextIndex::open` whose
+    /// manifest is v5 must answer `fuzzy_search`, `doc_frequency`, `contains`
+    /// and `live_document_count` byte-identically to a `TextIndex` holding the
+    /// same corpus on the heap. Nothing proved that until now, so the backend
+    /// could have been right and the routing to it wrong.
+    #[test]
+    fn a_mapped_store_answers_the_public_api_identically() {
+        let docs = corpus();
+        let heap = heap_index(&docs);
+        heap.seg.write().segment_count = 4;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = dir.path().join("index.bin");
+        heap.persist_mapped(&storage).expect("persist_mapped");
+
+        let opened: TextIndex<Key> = TextIndex::open(Some(&storage)).expect("open");
+        // The control: it really is serving from a mapping, or this compares the
+        // heap path against itself.
+        assert!(
+            opened.mapped.read().is_some(),
+            "the store must be served from a mapping, or this test proves nothing"
+        );
+        assert!(
+            opened.index.read().is_empty() && opened.docs.read().is_empty(),
+            "exactly one backend holds the committed state, and it is not the heap"
+        );
+
+        assert_eq!(opened.live_document_count(), heap.live_document_count());
+        for (id, _) in &docs {
+            assert!(
+                opened.contains(id),
+                "{id:?} is missing through the public api"
+            );
+        }
+        let mut answered = 0usize;
+        for query in QUERIES {
+            for limit in [1usize, 3, 5, 100] {
+                let want = heap.fuzzy_search(query, limit).expect("heap");
+                let got = opened.fuzzy_search(query, limit).expect("mapped store");
+                assert_identical(
+                    &format!("public api, query={query:?} limit={limit}"),
+                    &got,
+                    &want,
+                );
+                answered += want.len();
+            }
+        }
+        assert_reaches_every_document(
+            "public api",
+            &opened
+                .fuzzy_search("shared", docs.len() * 2)
+                .expect("mapped store"),
+            docs.len(),
+        );
+        assert!(
+            answered > 3 * docs.len(),
+            "only {answered} results, so this proves little"
+        );
+        for term in ["parse", "widget", "shared", "user", "zzzznotathing"] {
+            assert_eq!(
+                opened.doc_frequency(term),
+                heap.doc_frequency(term),
+                "doc_frequency({term:?}) through the public api"
+            );
+        }
+    }
+
+    /// A commit onto a mapped store lands, and lands as a rewrite of the image.
+    ///
+    /// The staged state on a mapped store is a delta rather than a snapshot, so
+    /// this is where that shape is proved: upserts, removals and a removal
+    /// superseded by an upsert, all in one batch, compared against a heap index
+    /// built from the corpus those operations describe.
+    #[test]
+    fn a_commit_onto_a_mapped_store_applies_the_delta() {
+        let docs = corpus();
+        let seed = heap_index(&docs);
+        seed.seg.write().segment_count = 4;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = dir.path().join("index.bin");
+        seed.persist_mapped(&storage).expect("persist_mapped");
+
+        let opened: TextIndex<Key> = TextIndex::open(Some(&storage)).expect("open");
+        assert!(opened.mapped.read().is_some(), "the control: it is mapped");
+
+        // A removal, an update of an existing document, a brand new document,
+        // and a removal that a later upsert supersedes.
+        let removed = Key(4);
+        let updated = Key(7);
+        let added = Key(9_100);
+        let resurrected = Key(11);
+        opened.remove(&removed).expect("remove");
+        opened.remove(&resurrected).expect("remove");
+        opened
+            .upsert_searchable(updated, &after_doc("updatedName"))
+            .expect("upsert");
+        opened
+            .upsert_searchable(added, &after_doc("addedName"))
+            .expect("upsert");
+        opened
+            .upsert_searchable(resurrected, &after_doc("resurrectedName"))
+            .expect("upsert");
+        opened.commit().expect("commit");
+
+        // The corpus those operations describe, built on the heap from scratch.
+        let mut expected: Vec<(Key, Doc)> = corpus()
+            .into_iter()
+            .filter(|(id, _)| *id != removed && *id != updated && *id != resurrected)
+            .collect();
+        expected.push((updated, after_doc("updatedName")));
+        expected.push((added, after_doc("addedName")));
+        expected.push((resurrected, after_doc("resurrectedName")));
+        let reference = heap_index(&expected);
+
+        for handle in [&opened] {
+            assert_eq!(
+                handle.live_document_count(),
+                reference.live_document_count(),
+                "document count after the delta"
+            );
+            assert!(
+                !handle.contains(&removed),
+                "the removed document is still visible"
+            );
+            assert!(handle.contains(&added), "the added document is missing");
+            assert!(
+                handle.contains(&resurrected),
+                "the resurrected document is missing"
+            );
+        }
+
+        // And after a reopen, because a commit that only changed memory would
+        // pass everything above.
+        let reopened: TextIndex<Key> = TextIndex::open(Some(&storage)).expect("reopen");
+        assert!(
+            reopened.mapped.read().is_some(),
+            "still mapped after the commit"
+        );
+        assert_eq!(
+            reopened.live_document_count(),
+            reference.live_document_count()
+        );
+        let mut answered = 0usize;
+        for query in QUERIES {
+            let want = reference.fuzzy_search(query, 100).expect("heap");
+            for (label, got) in [
+                ("live", opened.fuzzy_search(query, 100).expect("live")),
+                (
+                    "reopened",
+                    reopened.fuzzy_search(query, 100).expect("reopened"),
+                ),
+            ] {
+                assert_identical(
+                    &format!("{label} after commit, query={query:?}"),
+                    &got,
+                    &want,
+                );
+            }
+            answered += want.len();
+        }
+        assert!(
+            answered > expected.len(),
+            "only {answered} results, so this proves little"
+        );
+    }
+
     /// A tie is broken by the id, and the tie is real.
     ///
     /// The second half is why this test exists. A tie-break is only reachable
