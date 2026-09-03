@@ -577,6 +577,21 @@ pub(crate) fn write_mapped<Id: DocId + Serialize>(
         })?;
     }
 
+    // Generations, and why a fixed 0 was a crash-safety defect rather than a
+    // simplification.
+    //
+    // A segment is published by renaming a temp file over its name, so an
+    // already-open mapping keeps its own inode and a reader in flight sees a
+    // consistent snapshot. But a SECOND write at the same generation renames
+    // over the very file the CURRENT manifest names, and a crash between that
+    // rename and the manifest's leaves the old manifest naming a mixture of old
+    // and new segments. The load-time sums would probably catch that, which is
+    // luck rather than design.
+    //
+    // Bumping past whatever the live manifest names is what makes the manifest
+    // the only commit point: until it is renamed into place, every file it names
+    // is untouched, so a crash leaves the previous image entirely intact.
+    let previous = read_manifest_gens(storage_path);
     let builds = bucket(index, doc_lengths, segment_count)?;
     let mut gens: Vec<Option<u64>> = vec![None; segment_count];
     let mut tombstones: Vec<Tombstones> = Vec::with_capacity(segment_count);
@@ -586,9 +601,14 @@ pub(crate) fn write_mapped<Id: DocId + Serialize>(
         let Some(encoded) = encode_segment(build)? else {
             continue;
         };
-        let file = segment_path(storage_path, segment, 0);
+        let gen = previous
+            .get(segment)
+            .and_then(|gen| *gen)
+            .map(|gen| gen.wrapping_add(1))
+            .unwrap_or(0);
+        let file = segment_path(storage_path, segment, gen);
         crate::write_and_promote(&file, &encoded)?;
-        gens[segment] = Some(0);
+        gens[segment] = Some(gen);
     }
 
     let manifest = MappedManifest {
@@ -603,7 +623,44 @@ pub(crate) fn write_mapped<Id: DocId + Serialize>(
     let encoded = bincode::serialize(&manifest).map_err(|err| {
         SearchError::IndexError(format!("failed to encode the mapped manifest: {err}"))
     })?;
-    crate::write_and_promote(&manifest_path(storage_path), &encoded)
+    crate::write_and_promote(&manifest_path(storage_path), &encoded)?;
+
+    // Committed. Reclaim the generations the new manifest no longer names.
+    // Best-effort on purpose: an orphan is harmless because load only follows
+    // the manifest, and on Windows a file another process still has mapped
+    // cannot be unlinked at all.
+    for (segment, old_gen) in previous.iter().enumerate() {
+        let Some(old_gen) = old_gen else { continue };
+        if manifest.segment_gens.get(segment).copied().flatten() != Some(*old_gen) {
+            let _ = std::fs::remove_file(segment_path(storage_path, segment, *old_gen));
+        }
+    }
+    Ok(())
+}
+
+/// The generations the manifest on disk names, or an empty list when there is
+/// no mapped manifest there.
+///
+/// Read as raw little-endian bytes for the version first, because a v3 or v4
+/// manifest is a different struct and `bincode` allows trailing bytes: decoding
+/// one as a `MappedManifest` would yield plausible generations rather than fail.
+/// A non-mapped or unreadable manifest yields no generations, so the write below
+/// starts at 0 and cannot collide with a file this format never wrote.
+fn read_manifest_gens(storage_path: &Path) -> Vec<Option<u64>> {
+    let Ok(bytes) = std::fs::read(manifest_path(storage_path)) else {
+        return Vec::new();
+    };
+    if bytes.len() < 4 {
+        return Vec::new();
+    }
+    let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if version != MAPPED_SEGMENT_VERSION {
+        return Vec::new();
+    }
+    match bincode::deserialize::<MappedManifest>(&bytes) {
+        Ok(manifest) if manifest.version == MAPPED_SEGMENT_VERSION => manifest.segment_gens,
+        _ => Vec::new(),
+    }
 }
 
 // ── The reader ───────────────────────────────────────────────────────────────
@@ -2041,6 +2098,89 @@ mod tests {
             format!("{error}").contains("not the mapped layout"),
             "the refusal must name the reason, got: {error}"
         );
+    }
+
+    /// A second write must not touch a file the live manifest names.
+    ///
+    /// The manifest is the only commit point, and that holds only while every
+    /// segment it names is untouched until it is replaced. A writer that reused
+    /// one generation renamed over the very file the current manifest pointed
+    /// at, so a crash between that rename and the manifest's would leave the old
+    /// manifest naming a mixture of old and new segments. The load-time sums
+    /// would probably have caught it, which is luck rather than design.
+    ///
+    /// Asserted as the mechanism rather than by simulating a crash: the paths
+    /// the new manifest names must be disjoint from the ones the old manifest
+    /// named, and an index opened before the second write must still answer.
+    #[test]
+    fn a_second_write_does_not_overwrite_the_live_manifests_segments() {
+        let docs = corpus();
+        let heap = heap_index(&docs);
+        heap.seg.write().segment_count = 4;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = crate::storage_file_path_for(dir.path());
+
+        heap.persist_mapped(dir.path()).expect("first persist");
+        let first = read_manifest_gens(&storage);
+        assert!(
+            first.iter().any(|gen| gen.is_some()),
+            "the first write must name at least one segment"
+        );
+        let first_paths: Vec<PathBuf> = first
+            .iter()
+            .enumerate()
+            .filter_map(|(segment, gen)| gen.map(|gen| segment_path(&storage, segment, gen)))
+            .collect();
+
+        // Open BEFORE the second write, and keep it open across it.
+        let before: MappedIndex<Key> = MappedIndex::open(dir.path()).expect("open first image");
+        let want = before
+            .fuzzy_search("shared", docs.len() * 2)
+            .expect("search");
+        assert_reaches_every_document("before the second write", &want, docs.len());
+
+        heap.persist_mapped(dir.path()).expect("second persist");
+        let second = read_manifest_gens(&storage);
+        let second_paths: Vec<PathBuf> = second
+            .iter()
+            .enumerate()
+            .filter_map(|(segment, gen)| gen.map(|gen| segment_path(&storage, segment, gen)))
+            .collect();
+
+        assert_eq!(
+            first_paths.len(),
+            second_paths.len(),
+            "the same segments should be populated by both writes"
+        );
+        for path in &second_paths {
+            assert!(
+                !first_paths.contains(path),
+                "the second write published {} , which the first manifest already named",
+                path.display()
+            );
+        }
+        for (segment, (old, new)) in first.iter().zip(second.iter()).enumerate() {
+            if let (Some(old), Some(new)) = (old, new) {
+                assert!(
+                    new > old,
+                    "segment {segment}: generation must advance, {old} to {new}"
+                );
+            }
+        }
+
+        // The handle opened before the second write still answers, which is what
+        // a rename rather than an in-place rewrite buys.
+        let after = before
+            .fuzzy_search("shared", docs.len() * 2)
+            .expect("search");
+        assert_identical("across a second write", &after, &want);
+
+        // And the new image opens and answers too.
+        let reopened: MappedIndex<Key> = MappedIndex::open(dir.path()).expect("open second image");
+        let got = reopened
+            .fuzzy_search("shared", docs.len() * 2)
+            .expect("search");
+        assert_identical("the second image", &got, &want);
     }
 
     /// A term whose every document was removed is not a term the index holds.
