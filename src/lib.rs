@@ -1616,6 +1616,13 @@ impl<Id: DocId> TextIndex<Id> {
         *self.total_doc_length.write() = total_doc_length;
         // Clear any pending staged state.
         *self.staged.write() = None;
+        // And the mapping this replaces. A rebuild puts the whole corpus in the
+        // heap maps, so leaving a mapped backend installed would leave BOTH
+        // holding committed state, reads still answering from the stale image,
+        // and the following commit taking the mapped path with an empty delta:
+        // the rebuild would be silently discarded. That is the path kin-db takes
+        // to rebuild the text index from the graph.
+        *self.mapped.write() = None;
         self.mark_all_segments_dirty();
 
         Ok(())
@@ -1686,6 +1693,13 @@ impl<Id: DocId> TextIndex<Id> {
         *self.doc_count.write() = doc_count;
         *self.total_doc_length.write() = total_doc_length;
         *self.staged.write() = None;
+        // And the mapping this replaces. A rebuild puts the whole corpus in the
+        // heap maps, so leaving a mapped backend installed would leave BOTH
+        // holding committed state, reads still answering from the stale image,
+        // and the following commit taking the mapped path with an empty delta:
+        // the rebuild would be silently discarded. That is the path kin-db takes
+        // to rebuild the text index from the graph.
+        *self.mapped.write() = None;
         self.mark_all_segments_dirty();
 
         Ok(())
@@ -2289,8 +2303,9 @@ where
         };
 
         if self.incremental_enabled {
-            self.persist_segmented(path)
-        } else {
+            return self.persist_mapped_and_install(path);
+        }
+        {
             self.persist_monolithic(path)?;
             // Transition safety: if this index was previously segmented, the
             // monolithic file we just wrote is now the truth — retire the stale
@@ -2900,6 +2915,21 @@ where
     /// holding `index.bin`.
     pub fn persist_mapped(&self, path: &Path) -> Result<(), SearchError> {
         let storage_path = storage_file_path_for(path);
+        self.write_mapped_image(&storage_path)?;
+        // The mapped image is now the canonical one at this path, so the bincode
+        // writer's delta baseline has to go: a v4 commit must never publish a
+        // manifest naming v5 files.
+        let mut seg = self.seg.write();
+        seg.baseline_gens = None;
+        seg.segment_docs = None;
+        seg.dirty = SegmentDirty::All;
+        Ok(())
+    }
+
+    /// Write the live heap index as a mapped image at `storage_path`, and report
+    /// what it wrote.
+    fn write_mapped_image(&self, storage_path: &Path) -> Result<(usize, usize), SearchError> {
+        let storage_path = storage_file_path_for(storage_path);
         // All FOUR live guards are held at once, and that is the difference
         // between a consistent image and a rejected one.
         //
@@ -2944,19 +2974,46 @@ where
                 *doc_count, *total_doc_length
             )));
         }
+        Ok((written_docs, written_length))
+    }
 
-        // The mapped image is now the canonical one at this path, so the
-        // bincode writer's delta baseline has to go.
-        //
-        // Without this the next ordinary `commit` is a DELTA: it rewrites only
-        // the segments whose documents changed, in v4, and publishes a v4
-        // manifest that still names the old generation for every other segment.
-        // Those segments now hold `KINSEG05` files, so the following `open`
-        // decodes the magic as a bincode map length, fails, archives the
-        // manifest as corrupt, and the whole persisted index is gone, with the
-        // monolithic fallback already unlinked. Clearing the baseline forces
-        // that commit to be a full establishing rewrite, whose manifest names
-        // only files it just wrote.
+    /// Write the live heap index as a mapped image and hand the committed state
+    /// over to it.
+    ///
+    /// This is the flip that makes a daemon get any of this. Before it a store
+    /// wrote the bincode segmented format and `open` had nothing to map, so the
+    /// format existed and nothing used it.
+    ///
+    /// It runs only from the heap side, because a commit on a store that is
+    /// already mapped goes through `commit_mapped` and never reaches here. So
+    /// this is the conversion: a fresh store's first commit, and the first
+    /// commit after a rebuild replaced the corpus.
+    fn persist_mapped_and_install(&self, path: &Path) -> Result<(), SearchError> {
+        let (doc_count, total_doc_length) = self.write_mapped_image(path)?;
+        let mapped = MappedIndex::open_archiving(path, true)?;
+        if mapped.live_document_count() != doc_count
+            || mapped.total_doc_length() != total_doc_length
+        {
+            return Err(SearchError::IndexError(format!(
+                "the image just written holds {} documents of {} tokens and the write reported \
+                 {doc_count} of {total_doc_length}",
+                mapped.live_document_count(),
+                mapped.total_doc_length()
+            )));
+        }
+        *self.mapped.write() = Some(mapped);
+        // Exactly one backend holds the committed state, so the heap side is
+        // released rather than left as a second copy of what is now pages. The
+        // vocabulary goes too: it exists to name the tokens a forward map holds,
+        // and a mapped store has no forward map. The trigram goes because the
+        // mapped path answers substrings from the term dictionary.
+        self.index.write().clear();
+        self.docs.write().clear();
+        *self.vocab.write() = Vocabulary::default();
+        *self.trigram.write() = None;
+        *self.doc_count.write() = doc_count;
+        *self.total_doc_length.write() = total_doc_length;
+        self.index_epoch.fetch_add(1, Ordering::Relaxed);
         let mut seg = self.seg.write();
         seg.baseline_gens = None;
         seg.segment_docs = None;
