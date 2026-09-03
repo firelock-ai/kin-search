@@ -3482,7 +3482,9 @@ mod tests {
             for id in ids {
                 let doc = &docs[id];
                 for (token_id, weight) in &doc.tokens_by_field {
-                    let token = vocab.token(*token_id).expect("every stored id was interned");
+                    let token = vocab
+                        .token(*token_id)
+                        .expect("every stored id was interned");
                     seg_index
                         .entry(token.as_ref().to_owned())
                         .or_default()
@@ -3503,7 +3505,9 @@ mod tests {
                 .collect();
             for doc in seg_docs.values_mut() {
                 for (token_id, _) in doc.tokens_by_field.iter_mut() {
-                    let token = vocab.token(*token_id).expect("every stored id was interned");
+                    let token = vocab
+                        .token(*token_id)
+                        .expect("every stored id was interned");
                     *token_id = seg_ids[token.as_ref()];
                 }
             }
