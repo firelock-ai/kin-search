@@ -4125,7 +4125,12 @@ mod tests {
 
     /// Incremental persist re-serializes ONLY the segments whose documents
     /// changed: adding one doc bumps exactly its segment's generation and leaves
-    /// every other segment file untouched. This is the scaling-cliff fix.
+    /// every other segment file untouched. This is the scaling-cliff fix, now
+    /// carried by `commit_mapped`'s `SegmentPlan::Carry` rather than by the
+    /// heap-side `seg.segment_docs` bookkeeping the deleted bincode writer used:
+    /// a mapped store clears that field on every conversion (it has nothing to
+    /// track once the mapping is the truth), so membership is asserted through
+    /// the public read path instead of by peeking at it.
     #[test]
     fn incremental_persist_rewrites_only_the_dirty_segment() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4135,8 +4140,6 @@ mod tests {
 
         let gens_before = read_manifest_gens(&storage);
         let segment_count = gens_before.len();
-        let members_before = idx.seg.read().segment_docs.as_ref().unwrap().clone();
-        assert_eq!(members_before.len(), segment_count);
 
         let new_id = TestId(99_999);
         let new_doc = TestDoc {
@@ -4160,18 +4163,20 @@ mod tests {
             vec![touched],
             "exactly the touched segment must be rewritten (the cliff fix)"
         );
-        let members_after = idx.seg.read().segment_docs.as_ref().unwrap().clone();
-        assert_eq!(members_after.len(), segment_count);
-        for s in 0..segment_count {
-            if s == touched {
-                assert!(members_after[s].contains(&new_id));
-                assert_eq!(members_after[s].len(), members_before[s].len() + 1);
-            } else {
-                assert_eq!(members_after[s], members_before[s]);
-            }
-        }
 
+        // Every carried segment's documents must have survived the touched
+        // segment's rewrite untouched, and the new document must answer. Asked
+        // through the public API rather than internal bookkeeping, so this
+        // proves what a caller can actually observe rather than what one field
+        // says it did.
         let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        for (id, _) in fixture_docs() {
+            assert!(
+                reopened.contains(&id),
+                "{id:?} went missing after a commit that should only have touched segment \
+                 {touched}"
+            );
+        }
         let hits = reopened.fuzzy_search("freshlyAddedSymbol", 10).unwrap();
         assert_eq!(hits[0].0, new_id);
         assert_eq!(reopened.live_document_count(), fixture_docs().len() + 1);
