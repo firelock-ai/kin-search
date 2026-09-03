@@ -4564,10 +4564,15 @@ mod tests {
         assert!(!manifest.exists(), "corrupt manifest must be archived");
     }
 
-    /// Toggling the flag OFF on a segmented index: it still loads, and the next
-    /// (monolithic) commit retires the manifest. Results are stable throughout.
+    /// Toggling the flag OFF on a MAPPED index has no effect: `commit` checks
+    /// `self.mapped` before it ever looks at `incremental_enabled`, so once a
+    /// store is on the v5 path there is no toggle back to the monolithic
+    /// format. That used to be reachable, when the flag chose between two
+    /// bincode writers; the bincode segmented writer is gone and a mapped store
+    /// commits through `commit_mapped` unconditionally, so this now asserts the
+    /// toggle is inert rather than asserting the conversion it used to make.
     #[test]
-    fn segmented_to_monolithic_toggle_preserves_results() {
+    fn toggling_off_a_mapped_index_does_not_revert_it() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("idx");
         let seg = build_into(&dir, true);
@@ -4575,18 +4580,25 @@ mod tests {
         let storage = TextIndex::<TestId>::storage_file_path(&dir);
         assert!(manifest_path(&storage).exists());
 
-        // Reopen with the flag off (auto-detects + loads the segmented index).
+        // Reopen with the flag off. The reopen maps the v5 image regardless of
+        // the flag, so this is exercising "the flag off on an already-mapped
+        // index", the same starting condition the retired test used.
         let mut idx = TextIndex::<TestId>::open(Some(&dir)).unwrap();
         idx.incremental_enabled = false;
         assert_eq!(all_query_results(&idx), before);
 
-        // A commit now writes monolithic and retires the stale manifest.
+        // A commit still writes v5: commit_mapped runs because the store is
+        // mapped, never consulting the flag that would have chosen a writer on
+        // a heap-backed store.
         idx.commit().unwrap();
         assert!(
-            !manifest_path(&storage).exists(),
-            "manifest must be retired"
+            manifest_path(&storage).exists(),
+            "a mapped store stays mapped; commit_mapped does not retire its own manifest"
         );
-        assert!(storage.exists(), "monolithic index.bin must be written");
+        assert!(
+            !storage.exists(),
+            "a mapped store never falls back to writing a monolithic index.bin"
+        );
 
         let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
         assert_eq!(all_query_results(&reopened), before);
