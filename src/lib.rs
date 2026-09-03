@@ -4514,6 +4514,12 @@ mod tests {
     }
 
     /// A manifest referencing a segment file that no longer exists is corrupt.
+    ///
+    /// The mapped reader opens each segment in index order and refuses on the
+    /// first one it cannot open (`open_segments` in `mapped.rs`), which reports
+    /// the segment and generation rather than the legacy loader's
+    /// "missing/unreadable segment" phrase; that phrasing was specific to the
+    /// bincode reader's parallel decode and this only needs the same substance.
     #[test]
     fn missing_segment_is_corrupt() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4527,8 +4533,12 @@ mod tests {
 
         let err = TextIndex::<TestId>::open(Some(&dir)).err().unwrap();
         assert!(
-            matches!(err, SearchError::CorruptIndex { ref reason, .. } if reason.contains("missing/unreadable segment")),
-            "expected missing-segment CorruptIndex, got {err:?}"
+            matches!(
+                err,
+                SearchError::CorruptIndex { ref reason, .. }
+                    if reason.contains("unreadable") && reason.contains(&format!("segment {target} gen {gen}"))
+            ),
+            "expected an unreadable-segment CorruptIndex naming segment {target} gen {gen}, got {err:?}"
         );
     }
 
