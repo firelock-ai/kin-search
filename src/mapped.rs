@@ -407,10 +407,6 @@ impl<Id: DocId + Serialize> SegmentBuild<Id> {
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.docs.is_empty()
-    }
-
     pub(crate) fn document_count(&self) -> usize {
         self.docs.len()
     }
