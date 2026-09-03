@@ -699,6 +699,29 @@ pub(crate) fn read_manifest_gens(storage_path: &Path) -> Vec<Option<u64>> {
     Vec::new()
 }
 
+/// What a write should do with one segment.
+///
+/// The distinction is not an optimisation, it is the difference between an
+/// incremental commit and a full rewrite. Without `Carry`, a commit with one
+/// changed document re-encodes and fsyncs all sixty-four segments; the suite's
+/// churn soak went from three seconds to over twenty-eight minutes and was
+/// killed, which is what a reconcile loop would do to a daemon.
+pub(crate) enum SegmentPlan<Id: DocId> {
+    /// Re-encode it from what this build holds.
+    Rewrite(SegmentBuild<Id>),
+    /// Leave the file alone and name the same generation again.
+    ///
+    /// The caller supplies the counts and the tombstones because it is holding
+    /// the image they come from, and the manifest has to carry both forward
+    /// unchanged or the reconciliation on the next open refuses.
+    Carry {
+        gen: Option<u64>,
+        tombstones: Tombstones,
+        doc_count: usize,
+        total_doc_length: usize,
+    },
+}
+
 /// Write a mapped image one segment at a time.
 ///
 /// `build` is asked for segment `k` and hands back everything that segment
@@ -720,7 +743,7 @@ pub(crate) fn write_mapped_streaming<Id, F>(
 ) -> Result<(usize, usize), SearchError>
 where
     Id: DocId + Serialize,
-    F: FnMut(usize) -> Result<SegmentBuild<Id>, SearchError>,
+    F: FnMut(usize) -> Result<SegmentPlan<Id>, SearchError>,
 {
     if let Some(parent) = storage_path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| {
@@ -738,7 +761,23 @@ where
     let mut total_doc_length = 0usize;
 
     for (segment, slot) in gens.iter_mut().enumerate() {
-        let mut segment_build = build(segment)?;
+        let mut segment_build = match build(segment)? {
+            SegmentPlan::Carry {
+                gen,
+                tombstones: carried,
+                doc_count: docs,
+                total_doc_length: length,
+            } => {
+                // Named again at the SAME generation, so the reclaim below sees
+                // no change and leaves the file alone.
+                *slot = gen;
+                tombstones.push(carried);
+                doc_count += docs;
+                total_doc_length += length;
+                continue;
+            }
+            SegmentPlan::Rewrite(build) => build,
+        };
         tombstones.push(Tombstones::for_docs(segment_build.document_count()));
         doc_count += segment_build.document_count();
         total_doc_length += segment_build.total_doc_length();
@@ -837,7 +876,9 @@ pub(crate) fn write_mapped<Id: DocId + Serialize>(
 
     let mut buckets = buckets.into_iter();
     write_mapped_streaming(storage_path, segment_count, graph_root_hash, |_| {
-        Ok(buckets.next().unwrap_or_else(SegmentBuild::new))
+        Ok(SegmentPlan::Rewrite(
+            buckets.next().unwrap_or_else(SegmentBuild::new),
+        ))
     })
 }
 
@@ -1435,6 +1476,28 @@ impl<Id: DocId> MappedIndex<Id> {
     /// The storage path this index was opened from.
     pub fn storage_path(&self) -> &Path {
         &self.storage_path
+    }
+
+    /// Everything a carried segment has to put back in the new manifest.
+    ///
+    /// `None` when the segment has no file, which the manifest names as `None`
+    /// too. Nothing is read out of the segment beyond its header, so carrying
+    /// costs nothing.
+    pub(crate) fn carry(&self, segment: usize) -> Option<(usize, usize, Tombstones)> {
+        let mapped = self.segments.get(segment)?.as_ref()?;
+        Some((
+            mapped.doc_count,
+            mapped.total_doc_length,
+            self.tombstones.get(segment).cloned().unwrap_or_default(),
+        ))
+    }
+
+    /// The generation the live manifest names for a segment.
+    pub(crate) fn segment_gen(&self, storage_path: &Path, segment: usize) -> Option<u64> {
+        read_manifest_gens(storage_path)
+            .get(segment)
+            .copied()
+            .flatten()
     }
 
     /// How many segments this image is partitioned into.
