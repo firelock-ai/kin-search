@@ -4909,9 +4909,16 @@ mod tests {
                     .join()
                     .expect("coordinator thread panicked (a worker assertion failed)");
             }
+            // Named as a deadlock rather than as an inversion. Both shapes end
+            // here and they are not the same defect: two threads can take two
+            // locks in opposite orders, and one thread can ask for a lock it is
+            // already holding, which `parking_lot` never grants. This helper
+            // now guards a single-threaded caller too, and calling that an
+            // inversion sent the last reader looking for a second thread.
             Err(_) => panic!(
-                "{label}: concurrent workload did not complete within {timeout:?} — \
-                 lock-order-inversion deadlock has regressed"
+                "{label}: workload did not complete within {timeout:?}, so a deadlock has \
+                 regressed: either an inversion between threads, or a lock re-acquired by the \
+                 thread that already holds it"
             ),
         }
     }
