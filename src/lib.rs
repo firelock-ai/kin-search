@@ -33,11 +33,12 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rayon::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -279,6 +280,44 @@ struct StagedState<Id: DocId> {
     /// has to be recorded rather than implied.
     #[serde(default)]
     removed: HashSet<Id>,
+}
+
+/// Proof, checked by the compiler, that the caller already holds `staged`.
+///
+/// `staged` is the outermost lock, and a persist has to run under it: it is what
+/// makes the four live-state fields a consistent snapshot rather than four reads
+/// from four moments. The write path reaches that persist through three frames,
+/// and the frame that needs the guarantee is the innermost one, so the obvious
+/// shape is for the innermost frame to take the lock itself.
+///
+/// That shape deadlocks. `parking_lot`'s `RwLock` is not reentrant: a `read()`
+/// from a thread that already holds the write guard parks forever, against
+/// itself, with no second thread involved. `commit` holds `staged.write()`
+/// across its persist, so once the default commit wrote v5 every persisted
+/// commit in the crate parked on its own guard.
+///
+/// So the lock is taken once, at the top of each path, and the proof travels
+/// down as this token. It is zero-sized and cannot be forged: the only way to
+/// build one is to hand a constructor a live guard, and the borrow keeps that
+/// guard alive for as long as the token is. `commit` builds one from its write
+/// guard; `persist_mapped`, which is entered without one, takes a read guard of
+/// its own first.
+#[derive(Clone, Copy)]
+struct StagedHeld<'a> {
+    _held: PhantomData<&'a ()>,
+}
+
+impl<'a> StagedHeld<'a> {
+    /// From a write guard, the mode a committer holds.
+    fn writing<T>(_guard: &'a RwLockWriteGuard<'_, T>) -> Self {
+        Self { _held: PhantomData }
+    }
+
+    /// From a read guard, the mode an explicit persist takes for itself. Read is
+    /// enough: it excludes every writer, which is all the snapshot needs.
+    fn reading<T>(_guard: &'a RwLockReadGuard<'_, T>) -> Self {
+        Self { _held: PhantomData }
+    }
 }
 
 /// The monolithic on-disk layout, whose documents keep owned token strings.
@@ -1602,10 +1641,36 @@ impl<Id: DocId> TextIndex<Id> {
             );
         }
 
-        // Replace live state directly, no staging needed. The epoch is bumped
-        // while the index write guard is held so a fuzzy reader observes a
-        // consistent (index, epoch) pair and rebuilds its trigram candidate
-        // index against this vocabulary.
+        // `staged` FIRST, then the live guards under it, and the order is the
+        // fix rather than a tidy-up.
+        //
+        // This used to publish the four live fields and take `staged` only
+        // afterwards, which is the canonical order backwards. It deadlocked
+        // nothing, because each of those four guards is dropped before the next
+        // is taken, so the rebuild never held two at once. What it broke is the
+        // mapped writer's snapshot.
+        //
+        // `write_mapped_image` holds `staged` and then reads `index`, `docs` and
+        // the two counters, and its comment says `staged` is what stops a
+        // rebuild landing in the middle of that. It did not, while the rebuild
+        // published before asking for `staged`: the writer could take the NEW
+        // `index` and then block on `docs` until the rebuild had moved on, and
+        // come away with a new inverted index against the old document set. It
+        // does not fail loudly either. `write_mapped` buckets by the document
+        // table it was given and drops every posting whose id that table does
+        // not hold, so `written_docs` matches the old `doc_count` it also read,
+        // the cross-check passes, and the image is quietly missing the new
+        // corpus.
+        //
+        // Publishing under ONE guard rather than five also keeps the vocabulary
+        // honest: `commit` holds this same lock across its whole persist, so a
+        // rebuild that published field by field could have its documents naming
+        // ids a freshly reset table no longer holds.
+        //
+        // The epoch is bumped while the index write guard is held so a fuzzy
+        // reader observes a consistent (index, epoch) pair and rebuilds its
+        // trigram candidate index against this vocabulary.
+        let mut staged_guard = self.staged.write();
         {
             let mut live = self.index.write();
             *live = index;
@@ -1614,11 +1679,6 @@ impl<Id: DocId> TextIndex<Id> {
         *self.docs.write() = docs;
         *self.doc_count.write() = doc_count;
         *self.total_doc_length.write() = total_doc_length;
-        // Published under ONE guard rather than five. `commit` holds this same
-        // lock across its whole persist, including the point where it releases
-        // the vocabulary, so a rebuild that published field by field could have
-        // its documents naming ids a freshly reset table no longer holds.
-        let mut staged_guard = self.staged.write();
         *staged_guard = None;
         // And the mapping this replaces. A rebuild puts the whole corpus in the
         // heap maps, so leaving a mapped backend installed would leave BOTH
@@ -1689,6 +1749,10 @@ impl<Id: DocId> TextIndex<Id> {
             );
         }
 
+        // `staged` first, then the live guards under it, for the reasons
+        // `rebuild_all` states above. The two paths publish identically and an
+        // inversion in either is an inversion in the type.
+        let mut staged_guard = self.staged.write();
         {
             let mut live = self.index.write();
             *live = index;
@@ -1697,7 +1761,6 @@ impl<Id: DocId> TextIndex<Id> {
         *self.docs.write() = docs;
         *self.doc_count.write() = doc_count;
         *self.total_doc_length.write() = total_doc_length;
-        let mut staged_guard = self.staged.write();
         *staged_guard = None;
         // And the mapping this replaces. A rebuild puts the whole corpus in the
         // heap maps, so leaving a mapped backend installed would leave BOTH
@@ -1758,7 +1821,9 @@ impl<Id: DocId> TextIndex<Id> {
             *self.doc_count.write() = state.doc_count;
             *self.total_doc_length.write() = state.total_doc_length;
         }
-        self.persist_to_disk()?;
+        // The guard travels down as a token rather than being taken again below.
+        // See `StagedHeld`: taking it again is a self-deadlock, not a wait.
+        self.persist_to_disk(StagedHeld::writing(&staged_guard))?;
         Ok(())
     }
 
@@ -2351,13 +2416,13 @@ where
     /// path rewrites only changed segments; when `KIN_SEARCH_INCREMENTAL_PERSIST`
     /// explicitly disables it, the legacy monolithic path rewrites the full
     /// bincode file.
-    fn persist_to_disk(&self) -> Result<(), SearchError> {
+    fn persist_to_disk(&self, staged: StagedHeld<'_>) -> Result<(), SearchError> {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
 
         if self.incremental_enabled {
-            return self.persist_mapped_and_install(path);
+            return self.persist_mapped_and_install(path, staged);
         }
         {
             self.persist_monolithic(path)?;
@@ -2703,6 +2768,11 @@ where
     /// path with an extension is the storage file, one without is a directory
     /// holding `index.bin`.
     pub fn persist_mapped(&self, path: &Path) -> Result<(), SearchError> {
+        // This entry point is reached without a guard, so it takes one, and it
+        // takes it FIRST: `staged` is the outermost lock, and a check that read
+        // `mapped` before it would be the one path in the crate asking for the
+        // two in the opposite order to `commit`.
+        let staged = self.staged.read();
         // It writes the HEAP index, and on a mapped store the heap is empty by
         // design. Without this it would publish a manifest of zero documents,
         // reclaim every segment file the old one named, and report success,
@@ -2718,10 +2788,10 @@ where
             ));
         }
         let storage_path = storage_file_path_for(path);
-        self.write_mapped_image(&storage_path)?;
-        // The mapped image is now the canonical one at this path, so the bincode
-        // writer's delta baseline has to go: a v4 commit must never publish a
-        // manifest naming v5 files.
+        self.write_mapped_image(&storage_path, StagedHeld::reading(&staged))?;
+        // The image at this path is now somebody else's, so this handle's delta
+        // bookkeeping is stale and is cleared rather than carried: it describes
+        // segments of an index this handle no longer matches.
         let mut seg = self.seg.write();
         seg.baseline_gens = None;
         seg.segment_docs = None;
@@ -2731,26 +2801,29 @@ where
 
     /// Write the live heap index as a mapped image at `storage_path`, and report
     /// what it wrote.
-    fn write_mapped_image(&self, storage_path: &Path) -> Result<(usize, usize), SearchError> {
+    fn write_mapped_image(
+        &self,
+        storage_path: &Path,
+        _staged: StagedHeld<'_>,
+    ) -> Result<(usize, usize), SearchError> {
         let storage_path = storage_file_path_for(storage_path);
         // All FOUR live guards are held at once, and that is the difference
         // between a consistent image and a rejected one.
         //
-        // `staged` is not enough on its own. `rebuild_all` and
-        // `rebuild_all_owned` publish `index`, then `docs`, then the two
-        // counters under four INDEPENDENT write guards and clear `staged` only
-        // afterwards, so a snapshot taken between the first two would bucket a
-        // new inverted index against the old document set. `bucket`'s
-        // membership filter then silently drops every posting for a new id, and
-        // the image is either refused by its own load-time cross-check or served
-        // with a wrong `avgdl`. Holding all four blocks that publication
-        // outright.
+        // `staged`, which the caller proves it holds, is not enough on its own.
+        // `rebuild_all` and `rebuild_all_owned` publish `index`, then `docs`,
+        // then the two counters, and they do it under `staged` for exactly this
+        // reason: a snapshot taken between the first two would bucket a new
+        // inverted index against the old document set. `bucket`'s membership
+        // filter then silently drops every posting for a new id, and the image
+        // is either refused by its own load-time cross-check or served with a
+        // wrong `avgdl`. Holding all four here, under `staged`, blocks that
+        // publication outright.
         //
-        // Order is `staged`, then the live guards in the order every other
-        // reader takes them (`index`, `docs`, `doc_count`, `total_doc_length`),
-        // then `seg`. That is the canonical order, so no writer or committer can
-        // invert it against this call.
-        let _staged = self.staged.read();
+        // Order is `staged` (the caller's), then the live guards in the order
+        // every other reader takes them (`index`, `docs`, `doc_count`,
+        // `total_doc_length`), then `seg`. That is the canonical order, so no
+        // writer or committer can invert it against this call.
         let index = self.index.read();
         let docs = self.docs.read();
         let doc_count = self.doc_count.read();
@@ -2791,8 +2864,12 @@ where
     /// already mapped goes through `commit_mapped` and never reaches here. So
     /// this is the conversion: a fresh store's first commit, and the first
     /// commit after a rebuild replaced the corpus.
-    fn persist_mapped_and_install(&self, path: &Path) -> Result<(), SearchError> {
-        let (doc_count, total_doc_length) = self.write_mapped_image(path)?;
+    fn persist_mapped_and_install(
+        &self,
+        path: &Path,
+        staged: StagedHeld<'_>,
+    ) -> Result<(), SearchError> {
+        let (doc_count, total_doc_length) = self.write_mapped_image(path, staged)?;
         let mapped = MappedIndex::open_archiving(path, true)?;
         if mapped.live_document_count() != doc_count
             || mapped.total_doc_length() != total_doc_length
@@ -3460,6 +3537,13 @@ mod tests {
     /// test can still exercise the untouched legacy reader against real v4
     /// bytes instead of a format this build can no longer write for itself.
     fn write_legacy_segmented_fixture(idx: &TextIndex<TestId>, storage: &Path) {
+        // Every real writer creates the store directory before it writes into
+        // it, and a fixture standing in for one has to as well. Without this the
+        // first segment write fails `NotFound` on a caller that passed a path
+        // under a directory nothing had made yet.
+        if let Some(parent) = storage.parent() {
+            std::fs::create_dir_all(parent).expect("create the store directory");
+        }
         let docs = idx.docs.read();
         let vocab = idx.vocab.read();
         let doc_count = *idx.doc_count.read();
@@ -4980,6 +5064,146 @@ mod tests {
             expected,
             "every concurrently-inserted doc must survive persistence"
         );
+    }
+
+    /// A single-threaded persisted commit must return. One thread, one call, no
+    /// contention: just a stopwatch.
+    ///
+    /// The class is a persist frame re-acquiring a lock its own caller already
+    /// holds. `commit` holds `staged` across its whole persist, on purpose, so a
+    /// frame below it that asked for `staged` again parked against itself:
+    /// `parking_lot`'s `RwLock` is not reentrant, and a read from the thread
+    /// holding the write guard waits for a guard that will not be released until
+    /// the read returns. Once the default commit wrote v5, that reached every
+    /// persisted commit in the crate, on every platform, at zero CPU.
+    ///
+    /// It carries a timeout for the same reason it exists. A self-deadlock has
+    /// no assertion to fail: it hangs the binary, the harness never finishes, and
+    /// the only signal is a hosted job that never reports. On 2026-09-03 the
+    /// three checks that run this suite sat `in_progress` for 46 minutes on an
+    /// idle runner while all seven that do not run tests concluded green. The
+    /// budget is what turns that into a red line in seconds.
+    ///
+    /// All three ways into the writer are called, because they take `staged`
+    /// differently: a first commit converts the heap and is handed the
+    /// committer's write guard, a second commit deltas onto the mapping, and
+    /// `persist_mapped` is entered with no guard at all and takes its own.
+    #[test]
+    fn a_persisted_commit_returns_without_retaking_a_lock_it_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("selfdeadlock");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        run_with_deadlock_timeout(
+            "single_threaded_persisted_commit",
+            std::time::Duration::from_secs(30),
+            {
+                let dir = dir.clone();
+                move || {
+                    let idx = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+                    idx.upsert(TestId(1), &[("selfDeadlockGuard", 5.0)])
+                        .unwrap();
+                    // The conversion, under `commit`'s own `staged` write guard.
+                    idx.commit().unwrap();
+                    idx.upsert(TestId(2), &[("selfDeadlockGuard", 5.0)])
+                        .unwrap();
+                    // And the delta onto the mapping, which is the other commit path.
+                    idx.commit().unwrap();
+                    assert_eq!(idx.live_document_count(), 2);
+
+                    // The explicit persist, entered with no guard in hand.
+                    let heap = TextIndex::<TestId>::new();
+                    heap.upsert(TestId(3), &[("selfDeadlockGuard", 5.0)])
+                        .unwrap();
+                    heap.commit().unwrap();
+                    heap.persist_mapped(&elsewhere).unwrap();
+                }
+            },
+        );
+
+        let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        assert_eq!(reopened.live_document_count(), 2);
+    }
+
+    /// A rebuild publishes nothing until it holds `staged`.
+    ///
+    /// `rebuild_all` replaces the four live fields wholesale. It used to replace
+    /// them first and take `staged` afterwards, and each of the four guards is
+    /// dropped before the next is taken, so nothing deadlocked and nothing was
+    /// obviously wrong. What was wrong is what `write_mapped_image` believes:
+    /// it holds `staged` and then reads `index`, `docs` and the two counters,
+    /// and its comment says `staged` is what stops a rebuild landing in the
+    /// middle of that.
+    ///
+    /// It did not. The writer could read the NEW inverted index, block on
+    /// `docs` until the rebuild moved past it, and come away with the new index
+    /// against the old document set. That image is not refused, either:
+    /// `write_mapped` drops every posting whose id the document table it was
+    /// handed does not hold, so its own count matches the old `doc_count` it
+    /// read beside it, the cross-check passes, and the corpus is quietly
+    /// missing.
+    ///
+    /// So the property under test is the ORDER and not a race outcome: while a
+    /// `staged` guard is held, the live state must not move. The window is
+    /// polled rather than slept through, so the assertion fires the moment a
+    /// rebuild publishes early instead of depending on a sleep being long
+    /// enough.
+    #[test]
+    fn a_rebuild_publishes_nothing_until_it_holds_staged() {
+        use std::sync::Arc;
+
+        let idx = Arc::new(TextIndex::<TestId>::new());
+        idx.upsert(TestId(1), &[("beforeRebuild", 1.0)]).unwrap();
+        idx.commit().unwrap();
+        assert_eq!(idx.live_document_count(), 1);
+        assert!(idx.index.read().contains_key("beforerebuild"));
+
+        // Held the way `write_mapped_image`'s caller holds it. Read is the
+        // weaker of the two modes, so proving it excludes a rebuild proves the
+        // write mode does too.
+        let held = idx.staged.read();
+
+        let rebuilding = {
+            let idx = Arc::clone(&idx);
+            std::thread::spawn(move || {
+                let docs: Vec<(TestId, Vec<(&str, f32)>)> = (0..8u64)
+                    .map(|k| (TestId(100 + k), vec![("afterRebuild", 1.0)]))
+                    .collect();
+                idx.rebuild_all(&docs).unwrap();
+            })
+        };
+
+        // Three seconds of chances. A rebuild of eight one-token documents has
+        // nothing to wait for except this guard, so under the old order it has
+        // long since replaced `index`, `docs` and both counters by the first
+        // poll.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            assert!(
+                !idx.index.read().contains_key("afterrebuild"),
+                "a rebuild published its inverted index while a `staged` guard was held, so a \
+                 persist running under that guard can read it against the old document table"
+            );
+            assert_eq!(
+                *idx.doc_count.read(),
+                1,
+                "a rebuild published its counters while a `staged` guard was held"
+            );
+            assert!(
+                idx.docs.read().contains_key(&TestId(1)),
+                "a rebuild published its document table while a `staged` guard was held"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // And it is a hold rather than a loss: released, the rebuild lands.
+        drop(held);
+        rebuilding.join().expect("the rebuilding thread panicked");
+        assert_eq!(idx.live_document_count(), 8);
+        assert!(idx.index.read().contains_key("afterrebuild"));
+        assert!(!idx.index.read().contains_key("beforerebuild"));
     }
 
     // postings: term -> (occurrences, sorted [(doc_id, weight vec)])
