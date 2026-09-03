@@ -419,32 +419,6 @@ impl<Id: DocId + Serialize> SegmentBuild<Id> {
         self.total_doc_length
     }
 
-    /// Admit one document and every occurrence it contributes.
-    ///
-    /// `tokens` is the document's occurrences in the order it produced them,
-    /// which is the order a posting's weights have to come back in, because the
-    /// scorer sums them one at a time and float addition is not associative.
-    pub(crate) fn push_document(
-        &mut self,
-        id: Id,
-        tokens: &[(String, f32)],
-        doc_length: usize,
-    ) -> Result<(), SearchError> {
-        let encoded = bincode::serialize(&id).map_err(|err| {
-            SearchError::IndexError(format!("failed to encode a document id: {err}"))
-        })?;
-        for (token, weight) in tokens {
-            let entry = self.terms.entry(token.clone()).or_default();
-            match entry.last_mut() {
-                Some((last, weights)) if *last == id => weights.push(*weight),
-                _ => entry.push((id, vec![*weight])),
-            }
-        }
-        self.docs.push((id, encoded, doc_length));
-        self.total_doc_length += doc_length;
-        Ok(())
-    }
-
     /// Admit one document whose postings are already grouped by token.
     ///
     /// This is the shape a mapped segment yields when it is read back, so an
@@ -746,7 +720,7 @@ where
     let mut doc_count = 0usize;
     let mut total_doc_length = 0usize;
 
-    for segment in 0..segment_count {
+    for (segment, slot) in gens.iter_mut().enumerate() {
         let mut segment_build = build(segment)?;
         tombstones.push(Tombstones::for_docs(segment_build.document_count()));
         doc_count += segment_build.document_count();
@@ -764,7 +738,7 @@ where
             .unwrap_or(0);
         let file = segment_path(storage_path, segment, gen);
         crate::write_and_promote(&file, &encoded)?;
-        gens[segment] = Some(gen);
+        *slot = Some(gen);
     }
 
     let manifest = MappedManifest {
