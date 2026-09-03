@@ -3448,14 +3448,103 @@ mod tests {
 
     // ── FIR-3064: vocabulary ids in the forward index ───────────────────────
 
+    /// Hand-write a fresh v4 (bincode) segmented store at `storage` from an
+    /// already-committed in-memory index's real state.
+    ///
+    /// `persist_segmented` is gone: a commit writes v5, and a store already on
+    /// v5 rewrites itself through `commit_mapped`, so nothing in this build can
+    /// produce fresh v4 bytes any other way. What is kept is the shape that
+    /// writer produced -- one `SegmentData` per non-empty segment, ids and
+    /// postings rebucketed against a segment-local vocabulary, a
+    /// `SegmentManifest` naming generation 0 for every present segment -- so a
+    /// test can still exercise the untouched legacy reader against real v4
+    /// bytes instead of a format this build can no longer write for itself.
+    fn write_legacy_segmented_fixture(idx: &TextIndex<TestId>, storage: &Path) {
+        let docs = idx.docs.read();
+        let vocab = idx.vocab.read();
+        let doc_count = *idx.doc_count.read();
+        let total_doc_length = *idx.total_doc_length.read();
+        let graph_root_hash = *idx.graph_root_hash.read();
+        let segment_count = idx.seg.read().segment_count.max(1);
+
+        let mut buckets: Vec<Vec<TestId>> = vec![Vec::new(); segment_count];
+        for id in docs.keys() {
+            buckets[segment_of(id, segment_count)].push(*id);
+        }
+
+        let mut segment_gens: Vec<Option<u64>> = vec![None; segment_count];
+        for (s, ids) in buckets.iter().enumerate() {
+            if ids.is_empty() {
+                continue;
+            }
+            let mut seg_index: HashMap<String, Postings<TestId>> = HashMap::new();
+            let mut seg_docs: HashMap<TestId, IndexedDoc> = HashMap::with_capacity(ids.len());
+            for id in ids {
+                let doc = &docs[id];
+                for (token_id, weight) in &doc.tokens_by_field {
+                    let token = vocab.token(*token_id).expect("every stored id was interned");
+                    seg_index
+                        .entry(token.as_ref().to_owned())
+                        .or_default()
+                        .add(*id, *weight);
+                }
+                seg_docs.insert(*id, doc.clone());
+            }
+            let seg_vocab = segment_vocabulary(&seg_index);
+            let seg_ids: HashMap<&str, u32> = seg_vocab
+                .iter()
+                .enumerate()
+                .map(|(position, token)| {
+                    (
+                        token.as_str(),
+                        u32::try_from(position).expect("a segment holds under 4 billion tokens"),
+                    )
+                })
+                .collect();
+            for doc in seg_docs.values_mut() {
+                for (token_id, _) in doc.tokens_by_field.iter_mut() {
+                    let token = vocab.token(*token_id).expect("every stored id was interned");
+                    *token_id = seg_ids[token.as_ref()];
+                }
+            }
+            let seg_doc_count = seg_docs.len();
+            let seg_total_len: usize = seg_docs.values().map(|d| d.doc_length).sum();
+            let seg_data = SegmentData {
+                index: seg_index,
+                docs: seg_docs,
+                doc_count: seg_doc_count,
+                total_doc_length: seg_total_len,
+            };
+            let encoded = bincode::serialize(&seg_data).unwrap();
+            std::fs::write(segment_path(storage, s, 0), &encoded).unwrap();
+            segment_gens[s] = Some(0);
+        }
+
+        let manifest = SegmentManifest {
+            version: SEGMENTED_FORMAT_VERSION,
+            segment_count,
+            segment_gens,
+            doc_count,
+            total_doc_length,
+            graph_root_hash,
+        };
+        std::fs::write(
+            manifest_path(storage),
+            bincode::serialize(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
     /// An index written before the forward map held vocabulary ids still opens.
     ///
     /// This is the migration the change must not require, and the manifest's
     /// two version checks were equalities, so before this test the answer was
     /// that it did require one. The fixture is aged deliberately rather than
-    /// mocked: a real index is built and persisted by this build, then every
-    /// segment is rewritten in the v3 shape with its documents carrying owned
-    /// token strings, and the manifest is re-stamped v3. Nothing else changes.
+    /// mocked: a real index is built and committed by this build, hand-written
+    /// as v4 (`write_legacy_segmented_fixture`, since this build no longer has
+    /// a v4 writer of its own), then every segment is rewritten in the v3 shape
+    /// with its documents carrying owned token strings, and the manifest is
+    /// re-stamped v3. Nothing else changes.
     ///
     /// Then it is opened and SEARCHED, because a load that produced an index
     /// with the right document count and the wrong token ids would pass a
@@ -3465,17 +3554,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path().join("index.bin");
 
-        // Build and persist at the current version.
+        // Build and commit in memory: persisting through this build's own
+        // commit() writes v5 since the cutover, and there is no live writer
+        // left that would give "the current version" a v4 meaning.
         let (id_a, doc_a) = make_doc("parse_header", "src/parse.rs", "function");
         let (id_b, doc_b) = make_doc("render_header", "src/render.rs", "function");
-        let expected = {
-            let index: TextIndex<TestId> = TextIndex::open(Some(&storage)).unwrap();
-            index.upsert_searchable(id_a, &doc_a).unwrap();
-            index.upsert_searchable(id_b, &doc_b).unwrap();
-            index.commit().unwrap();
-            index.fuzzy_search("header", 10).unwrap()
-        };
+        let source: TextIndex<TestId> = TextIndex::new();
+        source.upsert_searchable(id_a, &doc_a).unwrap();
+        source.upsert_searchable(id_b, &doc_b).unwrap();
+        source.commit().unwrap();
+        let expected = source.fuzzy_search("header", 10).unwrap();
         assert_eq!(expected.len(), 2, "the fixture must match both documents");
+
+        write_legacy_segmented_fixture(&source, &storage);
         assert!(
             manifest_path(&storage).exists(),
             "the fixture must have persisted segmented, or this ages nothing"
@@ -3540,10 +3631,13 @@ mod tests {
         );
 
         // The negative controls, so the range is a range and not an acceptance
-        // of anything.
+        // of anything. The upper bogus value is one past the whole readable
+        // range (MAX_SEGMENTED_FORMAT_VERSION, now the mapped format) rather
+        // than one past SEGMENTED_FORMAT_VERSION, which the cutover made a
+        // valid version under a different manifest shape.
         for bogus in [
             MIN_SEGMENTED_FORMAT_VERSION - 1,
-            SEGMENTED_FORMAT_VERSION + 1,
+            MAX_SEGMENTED_FORMAT_VERSION + 1,
         ] {
             let mut refused = manifest.clone();
             refused.version = bogus;
@@ -4439,11 +4533,27 @@ mod tests {
     /// single-core machine. What IS guaranteed is where the work runs: rayon
     /// executes `par_iter` closures on pool workers, so a sequential loader
     /// running inline on this test's thread fails both assertions below.
+    ///
+    /// This is a v4 property, not a v5 one: `open_segments` in `mapped.rs` maps
+    /// each segment in a plain sequential loop, because opening a mapped
+    /// segment is a header read rather than a full deserialize and there is no
+    /// longer enough per-segment work to be worth fanning out. `build_into`
+    /// would give this a v5 store since the cutover, so the fixture is
+    /// hand-written as v4 (`write_legacy_segmented_fixture`) to keep exercising
+    /// the legacy loader's own parallel decode, which is unchanged and still
+    /// load-bearing for every v3/v4 store in the field.
     #[test]
     fn segment_decode_runs_on_the_rayon_pool() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("seg");
-        let _idx = build_into(&dir, true);
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+        let source: TextIndex<TestId> = TextIndex::new();
+        source.seg.write().segment_count = 8;
+        for (id, doc) in fixture_docs() {
+            source.upsert_searchable(id, &doc).unwrap();
+        }
+        source.commit().unwrap();
+        write_legacy_segmented_fixture(&source, &storage);
 
         let _ = segment_decode_observer::take();
         let reloaded = TextIndex::<TestId>::open(Some(&dir)).unwrap();
