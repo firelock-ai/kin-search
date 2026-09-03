@@ -384,13 +384,113 @@ pub(crate) struct MappedManifest {
 // ── The writer ───────────────────────────────────────────────────────────────
 
 /// One segment's documents and the postings restricted to them.
-struct SegmentBuild<'a, Id: DocId> {
+///
+/// Owned rather than borrowed from a live index, and that is what lets a write
+/// build one segment, encode it, drop it and move on. Borrowing kept the whole
+/// corpus alive behind every segment, which made the write path's peak the size
+/// of the index it was replacing.
+pub(crate) struct SegmentBuild<Id: DocId> {
     /// Sorted by token bytes, which is the order an FST demands and the order
     /// the reader's substring walk yields.
-    terms: BTreeMap<&'a str, Vec<(Id, &'a [f32])>>,
+    terms: BTreeMap<String, Vec<(Id, Vec<f32>)>>,
     /// Sorted by the document id's encoded bytes, which fixes the ordinals.
     docs: Vec<(Id, Vec<u8>, usize)>,
     total_doc_length: usize,
+}
+
+impl<Id: DocId + Serialize> SegmentBuild<Id> {
+    pub(crate) fn new() -> Self {
+        Self {
+            terms: BTreeMap::new(),
+            docs: Vec::new(),
+            total_doc_length: 0,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.docs.is_empty()
+    }
+
+    pub(crate) fn document_count(&self) -> usize {
+        self.docs.len()
+    }
+
+    pub(crate) fn total_doc_length(&self) -> usize {
+        self.total_doc_length
+    }
+
+    /// Admit one document and every occurrence it contributes.
+    ///
+    /// `tokens` is the document's occurrences in the order it produced them,
+    /// which is the order a posting's weights have to come back in, because the
+    /// scorer sums them one at a time and float addition is not associative.
+    pub(crate) fn push_document(
+        &mut self,
+        id: Id,
+        tokens: &[(String, f32)],
+        doc_length: usize,
+    ) -> Result<(), SearchError> {
+        let encoded = bincode::serialize(&id).map_err(|err| {
+            SearchError::IndexError(format!("failed to encode a document id: {err}"))
+        })?;
+        for (token, weight) in tokens {
+            let entry = self.terms.entry(token.clone()).or_default();
+            match entry.last_mut() {
+                Some((last, weights)) if *last == id => weights.push(*weight),
+                _ => entry.push((id, vec![*weight])),
+            }
+        }
+        self.docs.push((id, encoded, doc_length));
+        self.total_doc_length += doc_length;
+        Ok(())
+    }
+
+    /// Admit one document whose postings are already grouped by token.
+    ///
+    /// This is the shape a mapped segment yields when it is read back, so an
+    /// incremental commit folds the surviving documents in without expanding
+    /// them into an occurrence list first.
+    pub(crate) fn push_postings(&mut self, id: Id, token: &str, weights: &[f32]) {
+        let entry = self.terms.entry(token.to_owned()).or_default();
+        match entry.last_mut() {
+            Some((last, existing)) if *last == id => existing.extend_from_slice(weights),
+            _ => entry.push((id, weights.to_vec())),
+        }
+    }
+
+    /// Record a document that `push_postings` contributed postings for.
+    pub(crate) fn push_document_meta(
+        &mut self,
+        id: Id,
+        doc_length: usize,
+    ) -> Result<(), SearchError> {
+        let encoded = bincode::serialize(&id).map_err(|err| {
+            SearchError::IndexError(format!("failed to encode a document id: {err}"))
+        })?;
+        self.docs.push((id, encoded, doc_length));
+        self.total_doc_length += doc_length;
+        Ok(())
+    }
+
+    /// Fix the ordinals. Called once, after every document is in.
+    fn seal(&mut self) {
+        // The encoded bytes are the ordering key, so a lookup can binary-search
+        // the blob without decoding anything.
+        self.docs.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+        // A term's postings have to be in ordinal order for the deltas below to
+        // be non-negative, and ordinals are positions in the sorted list, so
+        // this cannot happen before the sort above.
+        let ordinal_of: HashMap<Id, u32> = self
+            .docs
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (id, _, _))| (*id, ordinal as u32))
+            .collect();
+        for postings in self.terms.values_mut() {
+            postings
+                .sort_unstable_by_key(|(id, _)| ordinal_of.get(id).copied().unwrap_or(u32::MAX));
+        }
+    }
 }
 
 /// Encode one mapped segment.
@@ -399,22 +499,21 @@ struct SegmentBuild<'a, Id: DocId> {
 /// gets no file and a `None` generation in the manifest, exactly as the bincode
 /// format already does.
 fn encode_segment<Id: DocId + Serialize>(
-    build: &SegmentBuild<'_, Id>,
+    build: &mut SegmentBuild<Id>,
 ) -> Result<Option<Vec<u8>>, SearchError> {
     if build.docs.is_empty() {
         return Ok(None);
     }
+    u32::try_from(build.docs.len()).map_err(|_| {
+        SearchError::IndexError("a mapped segment holds over 4 billion documents".to_string())
+    })?;
 
     // Ordinals are positions in the id-sorted document list, so `ordinal -> id`
     // is a slice of the mapped blob and `id -> ordinal` is a binary search over
-    // it. Neither needs a resident map.
-    let mut ordinal_of: HashMap<Id, u32> = HashMap::with_capacity(build.docs.len());
-    for (ordinal, (id, _, _)) in build.docs.iter().enumerate() {
-        let ordinal = u32::try_from(ordinal).map_err(|_| {
-            SearchError::IndexError("a mapped segment holds over 4 billion documents".to_string())
-        })?;
-        ordinal_of.insert(*id, ordinal);
-    }
+    // it. Neither needs a resident map. `seal` fixes both that order and the
+    // per-term posting order, so nothing below has to look an ordinal up.
+    build.seal();
+    let build: &SegmentBuild<Id> = build;
 
     // The weight table interns the field weights, of which kin-db supplies
     // fourteen. Ordered by the f32's bit pattern rather than by value: that is a
@@ -440,22 +539,29 @@ fn encode_segment<Id: DocId + Serialize>(
         postings_buf.extend_from_slice(&bits.to_le_bytes());
     }
 
+    // Ordinals, resolved once for the whole segment rather than per term.
+    let ordinal_of: HashMap<Id, u32> = build
+        .docs
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (id, _, _))| (*id, ordinal as u32))
+        .collect();
+
     let mut fst_builder = fst::MapBuilder::memory();
     for (token, entries) in &build.terms {
         let offset = postings_buf.len() as u64;
 
-        // Ordinal order, so the deltas below are non-negative and the reader
-        // walks a segment's postings in one forward pass.
-        let mut ordered: Vec<(u32, &[f32])> = entries
+        // Already in ordinal order, because `seal` put it there, so the deltas
+        // below are non-negative and the reader walks in one forward pass.
+        let ordered: Vec<(u32, &[f32])> = entries
             .iter()
             .map(|(id, weights)| {
                 let ordinal = *ordinal_of
                     .get(id)
                     .expect("a posting names a document of its own segment");
-                (ordinal, *weights)
+                (ordinal, weights.as_slice())
             })
             .collect();
-        ordered.sort_unstable_by_key(|(ordinal, _)| *ordinal);
 
         let occurrences: usize = ordered.iter().map(|(_, weights)| weights.len()).sum();
         put_uvarint(&mut postings_buf, ordered.len() as u64);
@@ -565,68 +671,29 @@ fn encode_segment<Id: DocId + Serialize>(
     Ok(Some(out))
 }
 
-/// Bucket the live index into per-segment builds.
+/// Write a mapped image one segment at a time.
 ///
-/// Documents are assigned by the same `segment_of` the bincode format uses, so a
-/// document keeps its segment across a format change and an incremental commit
-/// still knows which segments a change touched.
-fn bucket<'a, Id: DocId + Serialize>(
-    index: &'a HashMap<String, Postings<Id>>,
-    doc_lengths: &HashMap<Id, usize>,
-    segment_count: usize,
-) -> Result<Vec<SegmentBuild<'a, Id>>, SearchError> {
-    let mut builds: Vec<SegmentBuild<'a, Id>> = (0..segment_count)
-        .map(|_| SegmentBuild {
-            terms: BTreeMap::new(),
-            docs: Vec::new(),
-            total_doc_length: 0,
-        })
-        .collect();
-
-    for (id, doc_length) in doc_lengths {
-        let segment = crate::segment_of(id, segment_count);
-        let encoded = bincode::serialize(id).map_err(|err| {
-            SearchError::IndexError(format!("failed to encode a document id: {err}"))
-        })?;
-        builds[segment].docs.push((*id, encoded, *doc_length));
-        builds[segment].total_doc_length += *doc_length;
-    }
-    for build in builds.iter_mut() {
-        // The encoded bytes are the ordering key, so a lookup can binary-search
-        // the blob without decoding anything. `bincode` is injective for a given
-        // type, so equal bytes mean equal ids.
-        build.docs.sort_unstable_by(|a, b| a.1.cmp(&b.1));
-    }
-
-    for (token, postings) in index {
-        for (id, weights) in &postings.by_doc {
-            if !doc_lengths.contains_key(id) {
-                continue;
-            }
-            let segment = crate::segment_of(id, segment_count);
-            builds[segment]
-                .terms
-                .entry(token.as_str())
-                .or_default()
-                .push((*id, weights.as_slice()));
-        }
-    }
-
-    Ok(builds)
-}
-
-/// Write the whole live index as a mapped image: one file per non-empty segment
-/// plus the manifest, which is renamed into place after every segment it names
-/// is fsynced.
-pub(crate) fn write_mapped<Id: DocId + Serialize>(
+/// `build` is asked for segment `k` and hands back everything that segment
+/// holds; the caller keeps nothing between calls and neither does this. That is
+/// the whole point: the previous writer bucketed all sixty-four segments before
+/// encoding any of them, so the write path's peak was the size of the index it
+/// was replacing, on a machine chosen because that index does not fit.
+///
+/// Generations come off the live manifest, whichever format wrote it, because
+/// `segment_path` is one namespace shared by both and no writer may rename onto
+/// a name the live manifest holds. Every segment file is fsynced before the
+/// manifest names it, and the superseded generation is reclaimed only after the
+/// manifest is published.
+pub(crate) fn write_mapped_streaming<Id, F>(
     storage_path: &Path,
-    index: &HashMap<String, Postings<Id>>,
-    doc_lengths: &HashMap<Id, usize>,
     segment_count: usize,
-    doc_count: usize,
-    total_doc_length: usize,
     graph_root_hash: Option<[u8; 32]>,
-) -> Result<(), SearchError> {
+    mut build: F,
+) -> Result<(usize, usize), SearchError>
+where
+    Id: DocId + Serialize,
+    F: FnMut(usize) -> Result<SegmentBuild<Id>, SearchError>,
+{
     if let Some(parent) = storage_path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| {
             SearchError::IndexError(format!(
@@ -636,30 +703,23 @@ pub(crate) fn write_mapped<Id: DocId + Serialize>(
         })?;
     }
 
-    // Generations, and why a fixed 0 was a crash-safety defect rather than a
-    // simplification.
-    //
-    // A segment is published by renaming a temp file over its name, so an
-    // already-open mapping keeps its own inode and a reader in flight sees a
-    // consistent snapshot. But a SECOND write at the same generation renames
-    // over the very file the CURRENT manifest names, and a crash between that
-    // rename and the manifest's leaves the old manifest naming a mixture of old
-    // and new segments. The load-time sums would probably catch that, which is
-    // luck rather than design.
-    //
-    // Bumping past whatever the live manifest names is what makes the manifest
-    // the only commit point: until it is renamed into place, every file it names
-    // is untouched, so a crash leaves the previous image entirely intact.
     let previous = read_manifest_gens(storage_path);
-    let builds = bucket(index, doc_lengths, segment_count)?;
     let mut gens: Vec<Option<u64>> = vec![None; segment_count];
     let mut tombstones: Vec<Tombstones> = Vec::with_capacity(segment_count);
+    let mut doc_count = 0usize;
+    let mut total_doc_length = 0usize;
 
-    for (segment, build) in builds.iter().enumerate() {
-        tombstones.push(Tombstones::for_docs(build.docs.len()));
-        let Some(encoded) = encode_segment(build)? else {
+    for segment in 0..segment_count {
+        let mut segment_build = build(segment)?;
+        tombstones.push(Tombstones::for_docs(segment_build.document_count()));
+        doc_count += segment_build.document_count();
+        total_doc_length += segment_build.total_doc_length();
+        let Some(encoded) = encode_segment(&mut segment_build)? else {
             continue;
         };
+        // Dropped before the write, so the encoded bytes and the build are not
+        // both resident while the file is fsynced.
+        drop(segment_build);
         let gen = previous
             .get(segment)
             .and_then(|gen| *gen)
@@ -694,50 +754,45 @@ pub(crate) fn write_mapped<Id: DocId + Serialize>(
             let _ = std::fs::remove_file(segment_path(storage_path, segment, *old_gen));
         }
     }
-    Ok(())
+    Ok((doc_count, total_doc_length))
 }
 
-/// The generations the manifest on disk names, whichever shape it is, or an
-/// empty list when there is no readable manifest there.
+/// Write a mapped image from the heap shapes, for a caller that already holds
+/// the whole index.
 ///
-/// Shared by BOTH writers, and that is the point rather than a convenience. A
-/// writer that derives generations only from its own in-memory baseline will
-/// pick 0 whenever that baseline is absent, and 0 is exactly what the other
-/// writer picks on an empty directory. The two then rename onto the same names
-/// while a manifest still points at them, which is the window either writer's
-/// generation scheme exists to close.
-///
-/// Read as raw little-endian bytes for the version first, because a v3 or v4
-/// manifest is a different struct and `bincode` allows trailing bytes: decoding
-/// one as a `MappedManifest` would yield plausible generations rather than fail.
-/// A non-mapped or unreadable manifest yields no generations, so the write below
-/// starts at 0 and cannot collide with a file this format never wrote.
-pub(crate) fn read_manifest_gens(storage_path: &Path) -> Vec<Option<u64>> {
-    let Ok(bytes) = std::fs::read(manifest_path(storage_path)) else {
-        return Vec::new();
-    };
-    if bytes.len() < 4 {
-        return Vec::new();
-    }
-    let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    if version == MAPPED_SEGMENT_VERSION {
-        return match bincode::deserialize::<MappedManifest>(&bytes) {
-            Ok(manifest) if manifest.version == MAPPED_SEGMENT_VERSION => manifest.segment_gens,
-            _ => Vec::new(),
-        };
-    }
-    // A v3 or v4 manifest's generations count too, because `segment_path` is one
-    // namespace shared by both formats. Ignoring them let a mapped write rename
-    // over the very files a live bincode manifest named, which destroys the
-    // previous image before the new manifest is published: a crash in that
-    // window leaves the old manifest pointing at a mixture.
-    if (crate::MIN_SEGMENTED_FORMAT_VERSION..MAPPED_SEGMENT_VERSION).contains(&version) {
-        return match bincode::deserialize::<crate::SegmentManifest>(&bytes) {
-            Ok(manifest) if manifest.version == version => manifest.segment_gens,
-            _ => Vec::new(),
-        };
-    }
-    Vec::new()
+/// One segment is bucketed at a time, so the encoder's peak is a segment even
+/// though the caller's own index is alive throughout. The full-rebuild path does
+/// not come through here; it streams its documents in directly.
+pub(crate) fn write_mapped<Id: DocId + Serialize>(
+    storage_path: &Path,
+    index: &HashMap<String, Postings<Id>>,
+    doc_lengths: &HashMap<Id, usize>,
+    segment_count: usize,
+    graph_root_hash: Option<[u8; 32]>,
+) -> Result<(usize, usize), SearchError> {
+    write_mapped_streaming(storage_path, segment_count, graph_root_hash, |segment| {
+        let mut build = SegmentBuild::new();
+        for (id, doc_length) in doc_lengths {
+            if crate::segment_of(id, segment_count) == segment {
+                build.push_document_meta(*id, *doc_length)?;
+            }
+        }
+        if build.is_empty() {
+            return Ok(build);
+        }
+        for (token, postings) in index {
+            for (id, weights) in &postings.by_doc {
+                if !doc_lengths.contains_key(id) {
+                    continue;
+                }
+                if crate::segment_of(id, segment_count) != segment {
+                    continue;
+                }
+                build.push_postings(*id, token, weights);
+            }
+        }
+        Ok(build)
+    })
 }
 
 // ── The reader ───────────────────────────────────────────────────────────────

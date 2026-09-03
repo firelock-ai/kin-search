@@ -2725,15 +2725,25 @@ where
         let doc_lengths: HashMap<Id, usize> =
             docs.iter().map(|(id, doc)| (*id, doc.doc_length)).collect();
         let segment_count = self.seg.read().segment_count.max(1);
-        mapped::write_mapped(
+        // The writer counts what it wrote rather than being told, so a caller
+        // whose counters disagree with its own maps produces an image that
+        // agrees with itself. The disagreement is then caught here, against the
+        // live counters, instead of being written into a manifest that the
+        // reader would refuse on the next open.
+        let (written_docs, written_length) = mapped::write_mapped(
             &storage_path,
             &index,
             &doc_lengths,
             segment_count,
-            *doc_count,
-            *total_doc_length,
             *self.graph_root_hash.read(),
         )?;
+        if written_docs != *doc_count || written_length != *total_doc_length {
+            return Err(SearchError::IndexError(format!(
+                "wrote {written_docs} documents of {written_length} tokens while the live counters \
+                 say {} of {}",
+                *doc_count, *total_doc_length
+            )));
+        }
 
         // The mapped image is now the canonical one at this path, so the
         // bincode writer's delta baseline has to go.
