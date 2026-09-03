@@ -1825,8 +1825,32 @@ impl<Id: DocId> TextIndex<Id> {
         }
         drop(vocab);
 
+        // The segments this delta actually reaches. A function of the DELTA and
+        // never of what the image happens to contain, so a removal of an id the
+        // image does not hold still costs one rewrite. That keeps the rule one
+        // sentence long, which is worth more than the rewrite it saves.
+        let mut dirty: HashSet<usize> = HashSet::new();
+        for id in staged_tokens.keys().chain(removed.iter()) {
+            dirty.insert(segment_of(id, segment_count));
+        }
+
         let (doc_count, total_doc_length) =
             mapped::write_mapped_streaming(path, segment_count, graph_root_hash, |segment| {
+                // A segment nothing touched keeps its file and its generation.
+                //
+                // Without this a commit with one changed document re-encoded and
+                // fsynced all sixty-four, which took the suite's churn soak from
+                // three seconds to over twenty-eight minutes before it was
+                // killed. A reconcile loop would do the same to a daemon.
+                if !dirty.contains(&segment) {
+                    let (docs, length, tombstones) = mapped.carry(segment).unwrap_or_default();
+                    return Ok(mapped::SegmentPlan::Carry {
+                        gen: mapped.segment_gen(path, segment),
+                        tombstones,
+                        doc_count: docs,
+                        total_doc_length: length,
+                    });
+                }
                 let mut build = mapped::SegmentBuild::new();
                 // What survives in the mapping: not removed, and not superseded
                 // by an upsert of the same id.
@@ -1845,7 +1869,7 @@ impl<Id: DocId> TextIndex<Id> {
                         .expect("a staged token list names a staged document");
                     build.push_document(*id, tokens, doc_length)?;
                 }
-                Ok(build)
+                Ok(mapped::SegmentPlan::Rewrite(build))
             })?;
 
         drop(mapped_guard);
