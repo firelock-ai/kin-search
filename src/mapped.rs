@@ -624,6 +624,7 @@ struct MappedSegment {
     post: (usize, usize),
     docs: (usize, usize),
     doc_count: usize,
+    total_doc_length: usize,
 }
 
 /// A term's postings, positioned for a forward walk.
@@ -697,6 +698,7 @@ impl MappedSegment {
             ));
         }
         let doc_count = read_u64(data, 16).ok_or("truncated doc count")? as usize;
+        let total_doc_length = read_u64(data, 24).ok_or("truncated total doc length")? as usize;
         let terms_off = read_u64(data, 40).ok_or("truncated terms offset")? as usize;
         let terms_len = read_u64(data, 48).ok_or("truncated terms length")? as usize;
         let post_off = read_u64(data, 56).ok_or("truncated postings offset")? as usize;
@@ -749,6 +751,7 @@ impl MappedSegment {
             post: (post_off, post_len),
             docs: (docs_off, docs_len),
             doc_count,
+            total_doc_length,
         })
     }
 
@@ -970,20 +973,45 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
         // names. A manifest paired with a stale or foreign segment set is the
         // class the bincode loader already refuses by summing its segments, and
         // it is refused here the same way rather than served as a short index.
-        let mapped_docs: usize = segments
-            .iter()
-            .flatten()
-            .map(|segment| segment.doc_count)
-            .sum();
-        let removed: usize = manifest.tombstones.iter().map(Tombstones::count).sum();
-        let expected = mapped_docs.saturating_sub(removed);
-        if expected != manifest.doc_count {
+        let mut mapped_docs = 0usize;
+        let mut mapped_length = 0usize;
+        let mut removed = 0usize;
+        let mut removed_length = 0usize;
+        for (segment, mapped) in segments.iter().enumerate() {
+            let Some(mapped) = mapped else { continue };
+            mapped_docs += mapped.doc_count;
+            mapped_length += mapped.total_doc_length;
+            // Walked rather than taken from a stored count, so the check stays
+            // right once a commit starts publishing tombstones: a removed
+            // document's LENGTH has to come out of the total as well as its
+            // count, or `avgdl` drifts and every score in the corpus moves. The
+            // cost is one pass per removed ordinal, and zero for an image this
+            // build writes.
+            let tombstones = &manifest.tombstones[segment];
+            if !tombstones.any() {
+                continue;
+            }
+            for ordinal in 0..mapped.doc_count {
+                let Ok(ordinal) = u32::try_from(ordinal) else {
+                    break;
+                };
+                if !tombstones.is_set(ordinal) {
+                    continue;
+                }
+                removed += 1;
+                removed_length += mapped.doc_length(ordinal).unwrap_or(0);
+            }
+        }
+        let expected_docs = mapped_docs.saturating_sub(removed);
+        let expected_length = mapped_length.saturating_sub(removed_length);
+        if expected_docs != manifest.doc_count || expected_length != manifest.total_doc_length {
             return Err(corrupt_index_error(
                 &m_path,
                 format!(
-                    "the segments hold {mapped_docs} documents with {removed} tombstoned, \
-                     which is {expected}, and the manifest claims {}",
-                    manifest.doc_count
+                    "the segments hold {mapped_docs} documents of {mapped_length} tokens with \
+                     {removed} documents of {removed_length} tokens tombstoned, which is \
+                     {expected_docs} of {expected_length}, and the manifest claims {} of {}",
+                    manifest.doc_count, manifest.total_doc_length
                 ),
                 false,
             ));
@@ -1140,6 +1168,21 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
                     continue;
                 }
             };
+            // A live count of zero means this term is NOT indexed, and skipping
+            // it is the whole of matching the heap index here.
+            //
+            // The heap index drops a posting list the moment it empties, so a
+            // term whose every document was removed is simply not a key it
+            // holds, and `min` never sees it. A mapped segment keeps the key in
+            // its FST until the segment is rewritten, so counting it would drag
+            // the minimum to zero and hand the caller a term-discrimination
+            // weight for a token nothing holds. Concretely: remove the only
+            // document containing `renderwidget`, then ask for
+            // `"renderwidget shared"`; the heap answers with `shared`'s count
+            // and this would have answered 0.
+            if df == 0 {
+                continue;
+            }
             minimum = Some(minimum.map_or(df, |m: usize| m.min(df)));
         }
         minimum.unwrap_or(0)
@@ -1220,11 +1263,18 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
             let slots = self.slots_for(query_token);
             if !slots.is_empty() {
                 let df = self.live_df(&slots)?;
-                terms.push(ScoringTerm {
-                    idf: idf_of(df),
-                    penalty: 1.0,
-                    slots,
-                });
+                // A term with no live documents is not a key the heap index
+                // holds, so it contributes no scoring term there either. It
+                // would contribute nothing here as well, having no live postings
+                // to walk, but skipping keeps the two paths the same shape and
+                // saves the walk.
+                if df > 0 {
+                    terms.push(ScoringTerm {
+                        idf: idf_of(df),
+                        penalty: 1.0,
+                        slots,
+                    });
+                }
             }
 
             if query_token.len() >= MIN_SUBSTRING_LEN {
@@ -1239,6 +1289,9 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
                         continue;
                     }
                     let df = self.live_df(&slots)?;
+                    if df == 0 {
+                        continue;
+                    }
                     terms.push(ScoringTerm {
                         idf: idf_of(df),
                         penalty: 0.5,
@@ -1992,6 +2045,66 @@ mod tests {
             format!("{error}").contains("not the mapped layout"),
             "the refusal must name the reason, got: {error}"
         );
+    }
+
+    /// A term whose every document was removed is not a term the index holds.
+    ///
+    /// The heap index drops a posting list the moment it empties, so such a term
+    /// is not a key it has and `min` over a multi-token term never sees it. A
+    /// mapped segment keeps the key in its FST until the segment is rewritten,
+    /// so counting it would drag that minimum to zero and hand the caller a
+    /// term-discrimination weight for a token nothing holds. Found by reading
+    /// the two implementations against each other rather than by a red test,
+    /// which is why the guard exists now.
+    #[test]
+    fn a_term_whose_documents_are_all_removed_is_not_indexed() {
+        let docs = corpus();
+        let heap = heap_index(&docs);
+        heap.seg.write().segment_count = 4;
+        let dir = tempfile::tempdir().expect("tempdir");
+        heap.persist_mapped(dir.path()).expect("persist_mapped");
+        let mut mapped: MappedIndex<Key> = MappedIndex::open(dir.path()).expect("open mapped");
+
+        // The control. `renderwidget` has to be held by exactly ONE document,
+        // or removing that document does not empty the term and this test
+        // measures nothing. Asserted rather than assumed.
+        assert_eq!(
+            mapped.doc_frequency("renderwidget"),
+            1,
+            "the fixture must give `renderwidget` exactly one document"
+        );
+        assert!(mapped.remove(&Key(1)), "Key(1) holds `renderwidget`");
+
+        let survivors: Vec<(Key, Doc)> = corpus().into_iter().filter(|(id, _)| id.0 != 1).collect();
+        let reference = heap_index(&survivors);
+
+        for term in ["renderwidget", "renderwidget shared", "shared renderwidget"] {
+            assert_eq!(
+                mapped.doc_frequency(term),
+                reference.doc_frequency(term),
+                "doc_frequency({term:?}) after the only holder of `renderwidget` was removed"
+            );
+        }
+        // And the value itself, so a change making both wrong the same way is
+        // still caught: `shared` is in every surviving document's body.
+        assert_eq!(
+            mapped.doc_frequency("renderwidget shared"),
+            survivors.len(),
+            "the answer must be `shared`'s count, not zero"
+        );
+
+        // Search must not admit the emptied term either.
+        let got = mapped
+            .fuzzy_search("renderwidget", 10)
+            .expect("mapped search");
+        let want = reference
+            .fuzzy_search("renderwidget", 10)
+            .expect("heap search");
+        assert!(
+            got.is_empty(),
+            "an emptied term must retrieve nothing, got {got:?}"
+        );
+        assert_identical("emptied term", &got, &want);
     }
 
     /// A tie is broken by the id, and the tie is real.
