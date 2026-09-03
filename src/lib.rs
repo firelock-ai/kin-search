@@ -724,6 +724,19 @@ fn manifest_path(storage_path: &Path) -> PathBuf {
     storage_path.with_file_name(name)
 }
 
+/// The version a manifest declares, read as raw little-endian bytes.
+///
+/// Read before any decode, because `bincode` allows trailing bytes: handing a
+/// manifest of one shape to the other's struct yields plausible nonsense rather
+/// than an error. `None` when there is no readable manifest there.
+fn version_of_manifest(storage_path: &Path) -> Option<u32> {
+    let bytes = std::fs::read(manifest_path(storage_path)).ok()?;
+    if bytes.len() < 4 {
+        return None;
+    }
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 /// Path of the file holding segment `k` at generation `gen`.
 fn segment_path(storage_path: &Path, segment: usize, gen: u64) -> PathBuf {
     let mut name = storage_path
@@ -1163,6 +1176,19 @@ pub struct TextIndex<Id: DocId = u64> {
     /// keep substring matching sublinear in vocabulary size. Rebuilt on demand
     /// whenever its stamped epoch falls behind `index_epoch`.
     trigram: RwLock<Option<TrigramIndex>>,
+    /// The committed index, served from a mapping, when the store on disk is v5.
+    ///
+    /// EXACTLY ONE backend holds the committed state. When this is `Some` the
+    /// heap maps above are empty and every read comes from the mapping; when it
+    /// is `None` the heap holds it, which is a store with no path at all and a
+    /// v3 or v4 store before its first commit converts it. Two live backends
+    /// would mean every query merging two answers, and the identity guard would
+    /// then be proving something about a merge rather than about the format.
+    ///
+    /// Staged writes are invisible to search until `commit` either way, so a
+    /// pending delta never has to participate in a query. That is what keeps the
+    /// dispatch a choice rather than a join.
+    mapped: RwLock<Option<MappedIndex<Id>>>,
 }
 
 impl<Id: DocId> Default for TextIndex<Id> {
@@ -1187,6 +1213,7 @@ impl<Id: DocId> TextIndex<Id> {
             seg: RwLock::new(SegmentPersistState::new(resolve_default_segment_count())),
             index_epoch: AtomicU64::new(0),
             trigram: RwLock::new(None),
+            mapped: RwLock::new(None),
         }
     }
 
@@ -1229,12 +1256,10 @@ impl<Id: DocId> TextIndex<Id> {
 
     /// Return the number of committed documents currently visible to search.
     pub fn live_document_count(&self) -> usize {
+        if let Some(mapped) = self.mapped.read().as_ref() {
+            return mapped.live_document_count();
+        }
         *self.doc_count.read()
-    }
-
-    /// Whether a committed document with this ID is currently visible to search.
-    pub fn contains(&self, doc_id: &Id) -> bool {
-        self.docs.read().contains_key(doc_id)
     }
 
     /// Document frequency of a query `term`: the number of committed documents
@@ -1246,6 +1271,9 @@ impl<Id: DocId> TextIndex<Id> {
     /// the minimum across tokens. Returns 0 when no token of the term is indexed
     /// (the caller treats 0 as "unknown" and falls back to its default weight).
     pub fn doc_frequency(&self, term: &str) -> usize {
+        if let Some(mapped) = self.mapped.read().as_ref() {
+            return mapped.doc_frequency(term);
+        }
         let index = self.index.read();
         let mut min_df: Option<usize> = None;
         for tok in tokenize(term) {
@@ -1271,6 +1299,7 @@ impl<Id: DocId> TextIndex<Id> {
             seg: RwLock::new(SegmentPersistState::new(resolve_default_segment_count())),
             index_epoch: AtomicU64::new(0),
             trigram: RwLock::new(None),
+            mapped: RwLock::new(None),
         }
     }
 
@@ -1689,6 +1718,30 @@ impl<Id: DocId> TextIndex<Id> {
         self.persist_to_disk()?;
         Ok(())
     }
+}
+
+impl<Id> TextIndex<Id>
+where
+    Id: DocId + Serialize + DeserializeOwned,
+{
+    // `contains` and `fuzzy_search` live here rather than in the unconstrained
+    // block, and that is a narrowing of their bounds worth stating.
+    //
+    // A mapped backend cannot encode a query id to binary-search the document
+    // table, nor decode a result id out of it, without `Serialize` and
+    // `DeserializeOwned`. Those are the bounds `open` has always required, and a
+    // mapped backend can only exist on an index that came through `open`, so no
+    // index that could reach these methods before is unable to now. A caller
+    // holding a non-serialisable id keeps every other method, including
+    // `live_document_count` and `doc_frequency`, which need neither.
+
+    /// Whether a committed document with this ID is currently visible to search.
+    pub fn contains(&self, doc_id: &Id) -> bool {
+        if let Some(mapped) = self.mapped.read().as_ref() {
+            return mapped.contains(doc_id);
+        }
+        self.docs.read().contains_key(doc_id)
+    }
 
     /// Search across indexed documents.
     ///
@@ -1705,6 +1758,9 @@ impl<Id: DocId> TextIndex<Id> {
             limit = limit
         )
         .entered();
+        if let Some(mapped) = self.mapped.read().as_ref() {
+            return mapped.fuzzy_search(query_str, limit);
+        }
         let query_tokens = tokenize(query_str);
         if query_tokens.is_empty() {
             return Ok(Vec::new());
@@ -1887,12 +1943,7 @@ impl<Id: DocId> TextIndex<Id> {
 
         Ok(results)
     }
-}
 
-impl<Id> TextIndex<Id>
-where
-    Id: DocId + Serialize + DeserializeOwned,
-{
     /// Open or create a persisted text search index.
     pub fn open(path: Option<&PathBuf>) -> Result<Self, SearchError> {
         Self::open_with_persistence(path, true)
@@ -1929,6 +1980,30 @@ where
         // segmented index opened with the flag off still loads (and the next
         // monolithic commit retires it), and vice-versa.
         if manifest_path(&storage_path).exists() {
+            // A mapped image is MAPPED, not decoded. This is the whole cutover
+            // in three lines: the segment files are opened, their headers and
+            // FST roots touched, and nothing else is read until a query asks
+            // for it. What the heap holds afterwards is the mapping handles,
+            // one bit per document and three counters.
+            //
+            // The segment count comes off the manifest so a later commit writes
+            // the same partition, and the bincode writer's delta baseline is
+            // left absent, because a v4 commit must never publish a manifest
+            // naming v5 files.
+            if version_of_manifest(&storage_path) == Some(MAPPED_SEGMENT_VERSION) {
+                let mapped = MappedIndex::open(&storage_path)?;
+                let segment_count = mapped.segment_count().max(1);
+                *index.graph_root_hash.write() = mapped.graph_root_hash();
+                *index.mapped.write() = Some(mapped);
+                index.index_epoch.fetch_add(1, Ordering::Relaxed);
+                let mut seg = index.seg.write();
+                seg.segment_count = segment_count;
+                seg.baseline_gens = None;
+                seg.segment_docs = None;
+                seg.dirty = SegmentDirty::All;
+                drop(seg);
+                return Ok(index);
+            }
             let loaded = Self::load_segmented(&storage_path, persist_changes)?;
             *index.index.write() = loaded.index;
             index.index_epoch.fetch_add(1, Ordering::Relaxed);

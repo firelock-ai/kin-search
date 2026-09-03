@@ -1386,84 +1386,7 @@ impl<Id: DocId> std::fmt::Debug for MappedIndex<Id> {
     }
 }
 
-impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
-    /// Open a mapped index written by [`write_mapped`].
-    ///
-    /// `path` is the same storage path the bincode formats use; the manifest and
-    /// the segment files are its siblings.
-    pub fn open(path: &Path) -> Result<Self, SearchError> {
-        let storage_path = crate::storage_file_path_for(path);
-        let m_path = manifest_path(&storage_path);
-        let bytes = std::fs::read(&m_path).map_err(|err| {
-            SearchError::IndexError(format!(
-                "failed to read text index manifest {}: {err}",
-                m_path.display()
-            ))
-        })?;
-        if bytes.len() < 4 {
-            return Err(corrupt_index_error(
-                &m_path,
-                format!("truncated manifest ({} bytes)", bytes.len()),
-                false,
-            ));
-        }
-        // The leading `version: u32` is read as raw little-endian bytes before
-        // committing to a struct layout, which is what lets one manifest path
-        // carry two shapes.
-        let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        if version != MAPPED_SEGMENT_VERSION {
-            return Err(corrupt_index_error(
-                &m_path,
-                format!(
-                    "manifest version {version} is not the mapped layout; \
-                     the mapped reader serves version {MAPPED_SEGMENT_VERSION} only"
-                ),
-                false,
-            ));
-        }
-        let manifest: MappedManifest = bincode::deserialize(&bytes).map_err(|err| {
-            corrupt_index_error(&m_path, format!("undecodable manifest: {err}"), false)
-        })?;
-        if manifest.version != version {
-            return Err(corrupt_index_error(
-                &m_path,
-                format!(
-                    "declared version {version} but decoded version {}",
-                    manifest.version
-                ),
-                false,
-            ));
-        }
-        if manifest.segment_gens.len() != manifest.segment_count
-            || manifest.tombstones.len() != manifest.segment_count
-        {
-            return Err(corrupt_index_error(
-                &m_path,
-                format!(
-                    "manifest segment_count {} disagrees with {} generations and {} tombstone sets",
-                    manifest.segment_count,
-                    manifest.segment_gens.len(),
-                    manifest.tombstones.len()
-                ),
-                false,
-            ));
-        }
-
-        let mut manifest = manifest;
-        let segments = open_segments(&storage_path, &manifest, &m_path, false)?;
-        reconcile(&m_path, &mut manifest, &segments, false)?;
-
-        Ok(Self {
-            segments,
-            tombstones: manifest.tombstones,
-            doc_count: manifest.doc_count,
-            total_doc_length: manifest.total_doc_length,
-            graph_root_hash: manifest.graph_root_hash,
-            storage_path,
-            marker: PhantomData,
-        })
-    }
-
+impl<Id: DocId> MappedIndex<Id> {
     /// Documents currently visible to search.
     pub fn live_document_count(&self) -> usize {
         self.doc_count
@@ -1479,52 +1402,19 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
         &self.storage_path
     }
 
-    fn segment_and_ordinal(&self, id: &Id) -> Option<(usize, u32)> {
-        let encoded = bincode::serialize(id).ok()?;
-        let segment_count = self.segments.len();
-        if segment_count == 0 {
-            return None;
-        }
-        let segment = crate::segment_of(id, segment_count);
-        let mapped = self.segments.get(segment)?.as_ref()?;
-        let ordinal = mapped.ordinal_of(&encoded)?;
-        Some((segment, ordinal))
+    /// How many segments this image is partitioned into.
+    ///
+    /// A later commit has to write the SAME partition, because a document's
+    /// segment is a hash of its id against this count and a changed count sends
+    /// documents to different files while the old ones still hold them.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
     }
 
-    /// Whether a live document with this id is visible to search.
-    pub fn contains(&self, id: &Id) -> bool {
-        match self.segment_and_ordinal(id) {
-            Some((segment, ordinal)) => !self.tombstones[segment].is_set(ordinal),
-            None => false,
-        }
-    }
-
-    /// Remove a document. Returns whether this call removed it.
-    ///
-    /// No forward map is consulted, because none exists: the ordinal's bit is
-    /// set and every posting walk skips it from here on. The document's postings
-    /// leave the file only when its segment is next rewritten.
-    ///
-    /// **The bit is not persisted by this call.** Tombstones live in the
-    /// manifest, and the manifest is written by [`write_mapped`], so a removal
-    /// made through this reader is visible to this handle and is lost when it is
-    /// dropped. That is the reader's contract until the commit path moves onto
-    /// this layout, and it is stated rather than implied because a delete that
-    /// silently does not survive a reopen is the worst shape this could take.
-    pub fn remove(&mut self, id: &Id) -> bool {
-        let Some((segment, ordinal)) = self.segment_and_ordinal(id) else {
-            return false;
-        };
-        let doc_length = self.segments[segment]
-            .as_ref()
-            .and_then(|mapped| mapped.doc_length(ordinal))
-            .unwrap_or(0);
-        if !self.tombstones[segment].set(ordinal) {
-            return false;
-        }
-        self.doc_count = self.doc_count.saturating_sub(1);
-        self.total_doc_length = self.total_doc_length.saturating_sub(doc_length);
-        true
+    /// The total token count across every live document, which is what `avgdl`
+    /// divides.
+    pub fn total_doc_length(&self) -> usize {
+        self.total_doc_length
     }
 
     /// Every segment holding `token`, with the offset of its postings.
@@ -1622,6 +1512,133 @@ impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
             minimum = Some(minimum.map_or(df, |m: usize| m.min(df)));
         }
         minimum.unwrap_or(0)
+    }
+}
+
+impl<Id: DocId + Serialize + DeserializeOwned> MappedIndex<Id> {
+    /// Open a mapped index written by [`write_mapped`].
+    ///
+    /// `path` is the same storage path the bincode formats use; the manifest and
+    /// the segment files are its siblings.
+    pub fn open(path: &Path) -> Result<Self, SearchError> {
+        let storage_path = crate::storage_file_path_for(path);
+        let m_path = manifest_path(&storage_path);
+        let bytes = std::fs::read(&m_path).map_err(|err| {
+            SearchError::IndexError(format!(
+                "failed to read text index manifest {}: {err}",
+                m_path.display()
+            ))
+        })?;
+        if bytes.len() < 4 {
+            return Err(corrupt_index_error(
+                &m_path,
+                format!("truncated manifest ({} bytes)", bytes.len()),
+                false,
+            ));
+        }
+        // The leading `version: u32` is read as raw little-endian bytes before
+        // committing to a struct layout, which is what lets one manifest path
+        // carry two shapes.
+        let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if version != MAPPED_SEGMENT_VERSION {
+            return Err(corrupt_index_error(
+                &m_path,
+                format!(
+                    "manifest version {version} is not the mapped layout; \
+                     the mapped reader serves version {MAPPED_SEGMENT_VERSION} only"
+                ),
+                false,
+            ));
+        }
+        let manifest: MappedManifest = bincode::deserialize(&bytes).map_err(|err| {
+            corrupt_index_error(&m_path, format!("undecodable manifest: {err}"), false)
+        })?;
+        if manifest.version != version {
+            return Err(corrupt_index_error(
+                &m_path,
+                format!(
+                    "declared version {version} but decoded version {}",
+                    manifest.version
+                ),
+                false,
+            ));
+        }
+        if manifest.segment_gens.len() != manifest.segment_count
+            || manifest.tombstones.len() != manifest.segment_count
+        {
+            return Err(corrupt_index_error(
+                &m_path,
+                format!(
+                    "manifest segment_count {} disagrees with {} generations and {} tombstone sets",
+                    manifest.segment_count,
+                    manifest.segment_gens.len(),
+                    manifest.tombstones.len()
+                ),
+                false,
+            ));
+        }
+
+        let mut manifest = manifest;
+        let segments = open_segments(&storage_path, &manifest, &m_path, false)?;
+        reconcile(&m_path, &mut manifest, &segments, false)?;
+
+        Ok(Self {
+            segments,
+            tombstones: manifest.tombstones,
+            doc_count: manifest.doc_count,
+            total_doc_length: manifest.total_doc_length,
+            graph_root_hash: manifest.graph_root_hash,
+            storage_path,
+            marker: PhantomData,
+        })
+    }
+
+    fn segment_and_ordinal(&self, id: &Id) -> Option<(usize, u32)> {
+        let encoded = bincode::serialize(id).ok()?;
+        let segment_count = self.segments.len();
+        if segment_count == 0 {
+            return None;
+        }
+        let segment = crate::segment_of(id, segment_count);
+        let mapped = self.segments.get(segment)?.as_ref()?;
+        let ordinal = mapped.ordinal_of(&encoded)?;
+        Some((segment, ordinal))
+    }
+
+    /// Whether a live document with this id is visible to search.
+    pub fn contains(&self, id: &Id) -> bool {
+        match self.segment_and_ordinal(id) {
+            Some((segment, ordinal)) => !self.tombstones[segment].is_set(ordinal),
+            None => false,
+        }
+    }
+
+    /// Remove a document. Returns whether this call removed it.
+    ///
+    /// No forward map is consulted, because none exists: the ordinal's bit is
+    /// set and every posting walk skips it from here on. The document's postings
+    /// leave the file only when its segment is next rewritten.
+    ///
+    /// **The bit is not persisted by this call.** Tombstones live in the
+    /// manifest, and the manifest is written by [`write_mapped`], so a removal
+    /// made through this reader is visible to this handle and is lost when it is
+    /// dropped. That is the reader's contract until the commit path moves onto
+    /// this layout, and it is stated rather than implied because a delete that
+    /// silently does not survive a reopen is the worst shape this could take.
+    pub fn remove(&mut self, id: &Id) -> bool {
+        let Some((segment, ordinal)) = self.segment_and_ordinal(id) else {
+            return false;
+        };
+        let doc_length = self.segments[segment]
+            .as_ref()
+            .and_then(|mapped| mapped.doc_length(ordinal))
+            .unwrap_or(0);
+        if !self.tombstones[segment].set(ordinal) {
+            return false;
+        }
+        self.doc_count = self.doc_count.saturating_sub(1);
+        self.total_doc_length = self.total_doc_length.saturating_sub(doc_length);
+        true
     }
 
     /// Indexed tokens containing `query_token`, globally sorted and deduplicated.
